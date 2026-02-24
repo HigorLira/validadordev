@@ -1,0 +1,1254 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Expansão Digital — MIA</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<script type="module">
+import{initializeApp}from"https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import{getAuth,signInWithEmailAndPassword,createUserWithEmailAndPassword,signOut,onAuthStateChanged,updateProfile}from"https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import{getFirestore,doc,setDoc,getDoc,getDocs,collection,query,where,orderBy,limit,addDoc,updateDoc,deleteDoc,serverTimestamp,Timestamp,onSnapshot}from"https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const firebaseConfig={apiKey:"AIzaSyC9rXjPNOPE7A1mTNFCFv_AJj2YUeO65YM",authDomain:"validadordev.firebaseapp.com",projectId:"validadordev",storageBucket:"validadordev.firebasestorage.app",messagingSenderId:"674241097543",appId:"1:674241097543:web:29d145a69b0120d1532662"};
+const app=initializeApp(firebaseConfig);
+const auth=getAuth(app);
+const db=getFirestore(app);
+
+// ═══════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════
+let currentUser=null,currentUserData=null;
+let configs=[],delayMin=400,delayMax=1200,batchSize=50,batchPause=120,globalDDD='';
+let uploadedData=null,headers=[];
+let validResultData=[],allResultData=[],editingConfigIdx=null;
+let masterTemplates=[],masterAdvogadoName='';
+let userTemplates=[],userAdvogadoName='',enabledMasterIdx=[],masterOverrides={},templateRotationIdx=0,sendTracker={};
+
+// MESSAGING STATE
+let conversations=[],activeConvId=null,msgListenerUnsub=null,convListenerUnsub=null;
+let kanbanCards=[],kanbanDragId=null,kanbanDragOverCol=null;
+let qrPollingInterval=null,evolutionConnected=false;
+
+// PERMISSIONS (default)
+const DEFAULT_PERMS={canSendMessages:true,canViewMessaging:true,canViewKanban:true,canMoveKanban:true,canUseQRConnect:false};
+
+// ═══════════════════════════════════════════════
+// FIREBASE HELPERS
+// ═══════════════════════════════════════════════
+async function withRetry(fn,{retries=3,backoff=2000,label=''}={}){
+  for(let attempt=1;attempt<=retries;attempt++){
+    try{return await fn()}catch(e){
+      if(attempt===retries)throw e;
+      const wait=backoff*attempt;
+      await new Promise(r=>setTimeout(r,wait));
+    }
+  }
+}
+async function fbGetDoc(path){try{return await withRetry(async()=>{const snap=await getDoc(doc(db,...path.split('/')));return snap.exists()?{id:snap.id,...snap.data()}:null},{label:'fbGetDoc'})}catch(e){return null}}
+async function fbSetDoc(path,data){try{await withRetry(async()=>{await setDoc(doc(db,...path.split('/')),data,{merge:true})},{label:'fbSetDoc'})}catch(e){console.error('fbSetDoc',e)}}
+async function fbGetCollection(col,constraints=[]){try{return await withRetry(async()=>{const q2=constraints.length?query(collection(db,col),...constraints):query(collection(db,col));const snap=await getDocs(q2);return snap.docs.map(d=>({id:d.id,...d.data()}))},{label:'fbGetCollection'})}catch(e){return[]}}
+async function fbAddDoc(col,data){try{return await withRetry(async()=>{const ref=await addDoc(collection(db,col),data);return ref.id},{label:'fbAddDoc'})}catch(e){return null}}
+async function fbUpdateDoc(path,data){try{await withRetry(async()=>{await updateDoc(doc(db,...path.split('/')),data)},{label:'fbUpdateDoc'})}catch(e){console.error('fbUpdateDoc',e)}}
+async function fbDeleteDoc(path){try{await withRetry(async()=>{await deleteDoc(doc(db,...path.split('/')))},{label:'fbDeleteDoc'})}catch(e){console.error('fbDeleteDoc',e)}}
+
+// ═══════════════════════════════════════════════
+// AUTH
+// ═══════════════════════════════════════════════
+onAuthStateChanged(auth,async(user)=>{
+  if(user){
+    currentUser=user;
+    const ud=await fbGetDoc('users/'+user.uid);
+    if(!ud){currentUserData={name:user.displayName||user.email,role:'user',active:true,permissions:{...DEFAULT_PERMS}};await fbSetDoc('users/'+user.uid,{...currentUserData,email:user.email,createdAt:serverTimestamp()})}
+    else{currentUserData=ud;if(!currentUserData.permissions)currentUserData.permissions={...DEFAULT_PERMS}}
+    if(!currentUserData.active){alert('Acesso suspenso. Contate o administrador.');await signOut(auth);return}
+    await loadFirebaseData();
+    syncWindowState();
+    flushPendingAudits();
+    addAudit('login',`Login realizado`);
+    setupUIForRole();
+    showPage('pageMain');
+  }else{currentUser=null;currentUserData=null;if(convListenerUnsub)convListenerUnsub();if(msgListenerUnsub)msgListenerUnsub();showPage('pageLogin')}
+});
+
+window.doLogin=async function(){
+  const email=document.getElementById('loginUser').value.trim(),pass=document.getElementById('loginPass').value;
+  if(!email||!pass){document.getElementById('loginError').textContent='Preencha e-mail e senha.';return}
+  document.getElementById('loginError').textContent='Entrando...';
+  try{await signInWithEmailAndPassword(auth,email,pass)}catch(e){
+    let msg='Erro ao entrar.';
+    if(e.code==='auth/user-not-found'||e.code==='auth/wrong-password'||e.code==='auth/invalid-credential')msg='E-mail ou senha incorretos.';
+    if(e.code==='auth/invalid-email')msg='E-mail inválido.';
+    if(e.code==='auth/too-many-requests')msg='Muitas tentativas. Aguarde.';
+    document.getElementById('loginError').textContent=msg}
+};
+window.doLogout=async function(){if(currentUser)await addAudit('logout','Logout realizado');if(convListenerUnsub)convListenerUnsub();if(msgListenerUnsub)msgListenerUnsub();if(qrPollingInterval){clearInterval(qrPollingInterval);qrPollingInterval=null}await signOut(auth);uploadedData=null;validResultData=[];allResultData=[];sendTracker={};document.getElementById('loginUser').value='';document.getElementById('loginPass').value='';document.getElementById('loginError').textContent='';setTimeout(()=>{document.getElementById('loginUser').focus()},300)};
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&document.getElementById('pageLogin').classList.contains('active'))window.doLogin()});
+
+function isMaster(){return currentUserData&&currentUserData.role==='master'}
+function hasPerm(perm){if(isMaster())return true;return currentUserData?.permissions?.[perm]!==false}
+
+// ═══════════════════════════════════════════════
+// LOAD DATA FROM FIREBASE
+// ═══════════════════════════════════════════════
+async function loadFirebaseData(){
+  const cfgDoc=await fbGetDoc('settings/apiConfigs');
+  if(cfgDoc){configs.length=0;(cfgDoc.configs||[]).forEach(c=>configs.push(c));delayMin=cfgDoc.delayMin??400;delayMax=cfgDoc.delayMax??1200;batchSize=cfgDoc.batchSize??50;batchPause=cfgDoc.batchPause??120;globalDDD=cfgDoc.ddd||''}
+  const mtDoc=await fbGetDoc('settings/masterTemplates');
+  masterTemplates.length=0;
+  if(mtDoc&&mtDoc.templates&&mtDoc.templates.length>0){mtDoc.templates.forEach(t=>masterTemplates.push(t));masterAdvogadoName=mtDoc.advogado||''}
+  if(masterTemplates.length===0){
+    masterTemplates.push({name:'Modelo 1',text:'Olá.\nGostaria de falar com o {NOME_CLIENTE}\n\nMe chamo {NOME_ADVOGADO}'});
+    masterTemplates.push({name:'Modelo 2',text:'Boa tarde!\nEstou buscando contato com {NOME_CLIENTE}.\n\nMeu nome é {NOME_ADVOGADO}, tudo bem?'});
+    masterTemplates.push({name:'Modelo 3',text:'Olá, boa tarde.\nVocê é {NOME_CLIENTE}?\n\nSou {NOME_ADVOGADO}, gostaria de conversar com você.'});
+  }
+  const upDoc=await fbGetDoc('userPrefs/'+currentUser.uid);
+  userTemplates.length=0;
+  if(upDoc){
+    (upDoc.templates||[]).forEach(t=>userTemplates.push(t));
+    userAdvogadoName=upDoc.advogado||masterAdvogadoName;
+    enabledMasterIdx.length=0;(upDoc.enabledMasterIdx!=null?upDoc.enabledMasterIdx:masterTemplates.map((_,i)=>i)).forEach(i=>enabledMasterIdx.push(i));
+    Object.keys(masterOverrides).forEach(k=>delete masterOverrides[k]);Object.assign(masterOverrides,upDoc.masterOverrides||{});
+  }else{
+    userAdvogadoName=masterAdvogadoName;
+    enabledMasterIdx.length=0;masterTemplates.forEach((_,i)=>enabledMasterIdx.push(i));
+    Object.keys(masterOverrides).forEach(k=>delete masterOverrides[k]);
+  }
+  syncWindowState();
+}
+
+async function saveConfigsToFB(){await fbSetDoc('settings/apiConfigs',{configs:configs.map(c=>({name:c.name||'',url:c.url||'',apikey:c.apikey||'',instance:c.instance||'',_tested:c._tested||null})),delayMin,delayMax,batchSize,batchPause,ddd:globalDDD})}
+async function saveMasterMsgsToFB(){await fbSetDoc('settings/masterTemplates',{templates:masterTemplates,advogado:masterAdvogadoName})}
+async function saveUserPrefsToFB(){await fbSetDoc('userPrefs/'+currentUser.uid,{templates:userTemplates,advogado:userAdvogadoName,enabledMasterIdx,masterOverrides})}
+
+async function addAudit(type,detail,reportData=null){
+  const entry={type,userId:currentUser.uid,userEmail:currentUser.email,userName:currentUserData?.name||'',date:serverTimestamp(),dateStr:new Date().toISOString(),detail,hasReport:!!(reportData&&reportData.length)};
+  let docId=null;
+  try{docId=await fbAddDoc('auditLog',entry)}catch(e){try{const local=JSON.parse(localStorage.getItem('ed_audit_pending')||'[]');local.push({...entry,date:null,report:reportData});localStorage.setItem('ed_audit_pending',JSON.stringify(local))}catch(e2){}return}
+  if(reportData&&reportData.length&&docId){const chunkSize=200;for(let i=0;i<reportData.length;i+=chunkSize){const chunk=reportData.slice(i,i+chunkSize);try{await fbAddDoc('auditLog/'+docId+'/details',{rows:chunk,chunkIdx:Math.floor(i/chunkSize)})}catch(e){}}}
+}
+async function flushPendingAudits(){
+  try{
+    const pending=JSON.parse(localStorage.getItem('ed_audit_pending')||'[]');
+    if(pending.length>0){for(const p of pending){const rd=p.report;delete p.report;p.date=serverTimestamp();const id=await fbAddDoc('auditLog',p);if(id&&rd&&rd.length){const cs=200;for(let i=0;i<rd.length;i+=cs){await fbAddDoc('auditLog/'+id+'/details',{rows:rd.slice(i,i+cs),chunkIdx:Math.floor(i/cs)})}}}localStorage.removeItem('ed_audit_pending')}
+  }catch(e){}
+}
+
+// ═══════════════════════════════════════════════
+// UI SETUP
+// ═══════════════════════════════════════════════
+function setupUIForRole(){
+  document.getElementById('loggedUserDisplay').textContent=(currentUserData?.name||currentUser.email)+(isMaster()?' (Admin)':'');
+  document.getElementById('btnAdmin').style.display=isMaster()?'flex':'none';
+  document.getElementById('btnApiHeader').style.display=isMaster()?'flex':'none';
+  // Show messaging button based on perm
+  const btnMsg=document.getElementById('btnMessaging');
+  if(btnMsg)btnMsg.style.display=hasPerm('canViewMessaging')?'flex':'none';
+  const btnKanban=document.getElementById('btnKanban');
+  if(btnKanban)btnKanban.style.display=hasPerm('canViewKanban')?'flex':'none';
+  updateHeaderIndicator();updateProcessButton();
+  // Start conversation listener for messaging badge
+  if(hasPerm('canViewMessaging'))startConvListener();
+}
+
+function showPage(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  if(id==='pageAdmin'){renderUsersList();renderAuditLog();renderAdminConfigs();renderMasterMsgTemplates()}
+  if(id==='pageSend')renderSendTable();
+  if(id==='pageMessaging'){if(!hasPerm('canViewMessaging')){showPage('pageMain');return}renderConversationList()}
+  if(id==='pageKanban'){if(!hasPerm('canViewKanban')){showPage('pageMain');return}loadAndRenderKanban()}
+}
+window.showPage=showPage;
+
+// ═══════════════════════════════════════════════
+// ADMIN: USERS
+// ═══════════════════════════════════════════════
+window.createUser=async function(){
+  const name=document.getElementById('newUserName').value.trim(),email=document.getElementById('newUserEmail').value.trim(),pass=document.getElementById('newUserPass').value;
+  const role=document.getElementById('newUserRole').value;
+  if(!name||!email||!pass){alert('Preencha todos os campos.');return}
+  if(pass.length<6){alert('Senha mínima: 6 caracteres.');return}
+  document.getElementById('btnCreateUser').disabled=true;document.getElementById('btnCreateUser').textContent='Criando...';
+  try{
+    const{getAuth:getAuth2,createUserWithEmailAndPassword:create2}=await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js");
+    const{initializeApp:initApp2}=await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js");
+    let secondaryApp;try{secondaryApp=initApp2(firebaseConfig,"secondary")}catch(e){const{getApp}=await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js");secondaryApp=getApp("secondary")}
+    const secondaryAuth=getAuth2(secondaryApp);
+    const cred=await create2(secondaryAuth,email,pass);
+    await fbSetDoc('users/'+cred.user.uid,{name,email,role,active:true,permissions:{...DEFAULT_PERMS},createdAt:serverTimestamp()});
+    await signOut(secondaryAuth);
+    document.getElementById('newUserName').value='';document.getElementById('newUserEmail').value='';document.getElementById('newUserPass').value='';
+    alert('Usuário criado com sucesso!');renderUsersList();
+  }catch(e){
+    let msg='Erro ao criar: '+e.message;
+    if(e.code==='auth/email-already-in-use')msg='Este e-mail já está cadastrado.';
+    if(e.code==='auth/weak-password')msg='Senha muito fraca.';
+    if(e.code==='auth/invalid-email')msg='E-mail inválido.';
+    alert(msg);
+  }finally{document.getElementById('btnCreateUser').disabled=false;document.getElementById('btnCreateUser').textContent='➕ Cadastrar'}
+};
+
+window.toggleUserStatus=async function(uid){const u=await fbGetDoc('users/'+uid);if(u&&u.role!=='master'){await fbUpdateDoc('users/'+uid,{active:!u.active});renderUsersList()}};
+window.deleteUser=async function(uid){if(!confirm('Excluir este usuário do sistema?'))return;await fbDeleteDoc('users/'+uid);renderUsersList()};
+
+async function renderUsersList(){
+  const allUsers=await fbGetCollection('users');
+  const el=document.getElementById('usersList');el.innerHTML='';
+  allUsers.sort((a,b)=>a.role==='master'?-1:1).forEach(u=>{
+    const isMst=u.role==='master';const statusCls=u.active!==false?'active-s':'suspended';const statusTxt=u.active!==false?'Ativo':'Suspenso';
+    const permsBtn=!isMst?`<button class="btn btn-secondary btn-small" onclick="openPermissions('${u.id}','${esc(u.name||u.email)}')">🔐 Permissões</button>`:'';
+    el.innerHTML+=`<div class="user-row"><div class="user-info"><span class="uname">${u.name||u.email}</span><span class="ustatus ${statusCls}">${statusTxt}</span><br><span class="urole">${u.email} · ${isMst?'👑 Master':'Operador'}</span></div><div class="user-actions">${permsBtn}${!isMst?`<button class="btn btn-secondary btn-small" onclick="toggleUserStatus('${u.id}')">${u.active!==false?'⏸ Suspender':'▶ Ativar'}</button><button class="btn-danger" onclick="deleteUser('${u.id}')">🗑️</button>`:'<span style="color:var(--text-dim);font-size:10px">Master</span>'}</div></div>`
+  })
+}
+
+// ═══════════════════════════════════════════════
+// PERMISSIONS MANAGEMENT
+// ═══════════════════════════════════════════════
+window.openPermissions=async function(uid,name){
+  const u=await fbGetDoc('users/'+uid);
+  const perms={...DEFAULT_PERMS,...(u?.permissions||{})};
+  document.getElementById('permUserId').value=uid;
+  document.getElementById('permUserName').textContent=name;
+  const permDefs=[
+    {key:'canSendMessages',label:'📨 Enviar mensagens individuais'},
+    {key:'canViewMessaging',label:'💬 Acessar sistema de mensageria'},
+    {key:'canViewKanban',label:'📋 Visualizar Kanban'},
+    {key:'canMoveKanban',label:'↔️ Mover cards no Kanban'},
+    {key:'canUseQRConnect',label:'📱 Conectar WhatsApp via QR Code'},
+  ];
+  const el=document.getElementById('permsList');
+  el.innerHTML=permDefs.map(p=>`<label class="perm-row"><input type="checkbox" id="perm_${p.key}" ${perms[p.key]!==false?'checked':''}><span>${p.label}</span></label>`).join('');
+  document.getElementById('permOverlay').classList.add('show');
+};
+
+window.closePermissions=function(){document.getElementById('permOverlay').classList.remove('show')};
+
+window.savePermissions=async function(){
+  const uid=document.getElementById('permUserId').value;
+  const permKeys=['canSendMessages','canViewMessaging','canViewKanban','canMoveKanban','canUseQRConnect'];
+  const perms={};
+  permKeys.forEach(k=>{perms[k]=document.getElementById('perm_'+k)?.checked!==false});
+  await fbUpdateDoc('users/'+uid,{permissions:perms});
+  window.closePermissions();
+  alert('Permissões salvas!');
+  renderUsersList();
+};
+
+// ═══════════════════════════════════════════════
+// ADMIN: AUDIT LOG
+// ═══════════════════════════════════════════════
+async function renderAuditLog(){
+  const fUser=document.getElementById('auditFilterUser').value,fType=document.getElementById('auditFilterType').value;
+  let allLogs=await _fetchAuditLogs();
+  const sel=document.getElementById('auditFilterUser');const prev=sel.value;
+  sel.innerHTML='<option value="">Todos</option>';
+  [...new Set(allLogs.map(a=>a.userEmail))].forEach(u=>{sel.innerHTML+=`<option value="${u}">${u}</option>`});sel.value=prev;
+  let filtered=allLogs;
+  if(fUser)filtered=filtered.filter(a=>a.userEmail===fUser);
+  if(fType)filtered=filtered.filter(a=>a.type===fType);
+  const el=document.getElementById('auditLogList');
+  if(filtered.length===0){el.innerHTML='<p style="color:var(--text-dim);text-align:center;padding:20px">Nenhum registro.</p>';return}
+  el.innerHTML=filtered.slice(0,300).map(a=>{
+    const d=a.date?.toDate?a.date.toDate():new Date(a.dateStr||0);
+    const dt=d.toLocaleDateString('pt-BR')+' '+d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+    const icon=a.type==='validation'?'🔍':(a.type==='send'?'📨':(a.type==='login'?'🟢':(a.type==='logout'?'🔴':(a.type==='message'?'💬':'📋'))));
+    const dlBtn=a.hasReport?` <button class="btn btn-secondary btn-small" onclick="downloadSingleReport('${a.id}')" style="margin-top:6px">📥 Baixar relatório</button>`:'';
+    return`<div class="audit-row"><div class="audit-meta">${icon} ${dt} — <strong>${a.userName||a.userEmail}</strong></div><div class="audit-detail">${a.detail}${dlBtn}</div></div>`
+  }).join('')
+}
+let _cachedAuditLogs=[];
+async function _fetchAuditLogs(){_cachedAuditLogs=await fbGetCollection('auditLog');_cachedAuditLogs.sort((a,b)=>(b.dateStr||'').localeCompare(a.dateStr||''));return _cachedAuditLogs}
+window.renderAuditLog=renderAuditLog;
+
+window.downloadSingleReport=async function(logId){
+  let entry=_cachedAuditLogs.find(a=>a.id===logId);
+  if(!entry){entry=await fbGetDoc('auditLog/'+logId)}
+  if(!entry){alert('Registro não encontrado.');return}
+  const chunks=await fbGetCollection('auditLog/'+logId+'/details');
+  chunks.sort((a,b)=>(a.chunkIdx||0)-(b.chunkIdx||0));
+  const allRows=[];chunks.forEach(c=>{if(c.rows)allRows.push(...c.rows)});
+  if(allRows.length===0){alert('Relatório sem dados detalhados.');return}
+  const d=entry.date?.toDate?entry.date.toDate():new Date(entry.dateStr||0);
+  const dt=d.toLocaleDateString('pt-BR')+' '+d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+  const wb=XLSX.utils.book_new();
+  const rows=[['Chamado','Nome','Telefone','WhatsApp']];
+  allRows.forEach(r=>{rows.push([r.chamado,r.nome,r.telefone,r.whatsapp])});
+  const ws=XLSX.utils.aoa_to_sheet(rows);ws['!cols']=[{wch:20},{wch:30},{wch:18},{wch:10}];
+  XLSX.utils.book_append_sheet(wb,ws,'Detalhado');
+  XLSX.writeFile(wb,`relatorio_${(entry.userName||'user').replace(/\s+/g,'_')}_${d.toISOString().slice(0,10)}.xlsx`)
+};
+
+window.downloadAuditLog=async function(){
+  const allLogs=await _fetchAuditLogs();
+  const wb=XLSX.utils.book_new();
+  const rows=[['Data','E-mail','Nome','Tipo','Detalhe']];
+  allLogs.forEach(a=>{const d=a.date?.toDate?a.date.toDate():new Date(a.dateStr||0);rows.push([d.toLocaleString('pt-BR'),a.userEmail,a.userName,a.type,a.detail])});
+  const ws=XLSX.utils.aoa_to_sheet(rows);ws['!cols']=[{wch:20},{wch:28},{wch:24},{wch:14},{wch:60}];
+  XLSX.utils.book_append_sheet(wb,ws,'Atividades');
+  XLSX.writeFile(wb,`relatorio_completo_${new Date().toISOString().slice(0,10)}.xlsx`)
+};
+
+// ═══════════════════════════════════════════════
+// ADMIN: API CONFIGS
+// ═══════════════════════════════════════════════
+function renderAdminConfigs(){renderConfigsTo('adminConfigsList')}
+window.openSettings=function(){if(!isMaster())return;document.getElementById('settingsOverlay').classList.add('show');document.getElementById('globalDelayMinModal').value=delayMin;document.getElementById('globalDelayMaxModal').value=delayMax;document.getElementById('globalBatchSizeModal').value=batchSize;document.getElementById('globalBatchPauseModal').value=batchPause;document.getElementById('globalDDDModal').value=globalDDD;renderConfigsTo('configsList')};
+window.closeSettings=function(){document.getElementById('settingsOverlay').classList.remove('show')};
+function renderConfigsTo(cid){
+  const list=document.getElementById(cid);if(!list)return;list.innerHTML='';
+  configs.forEach((c,i)=>{const isEd=editingConfigIdx===i;const badge=i===0?'primary':'fallback';const badgeT=i===0?'Principal':`Fallback ${i}`;
+    const sDot=c._tested===true?'ok':(c._tested===false?'err':'unk');const sTxt=c._tested===true?'OK':(c._tested===false?'Falha':'N/A');
+    list.innerHTML+=`<div class="config-item ${c._tested===true?'active':(c._tested===false?'error':'')}"><div class="config-header"><div class="config-header-left"><span class="config-badge ${badge}">${badgeT}</span><span class="config-name">${c.name||'Sem nome'}</span></div><div class="config-actions"><button class="config-action-btn" onclick="toggleEditConfig(${i})">✏️</button><button class="config-action-btn" onclick="testConfig(${i})">🔗</button>${configs.length>1?`<button class="config-action-btn del" onclick="removeConfig(${i})">🗑️</button>`:''}${i>0?`<button class="config-action-btn" onclick="moveConfigUp(${i})">⬆️</button>`:''}</div></div><div class="config-status"><span class="dot ${sDot}"></span>${sTxt}</div><div class="config-fields ${isEd?'show':''}" id="cf_${cid}_${i}"><div class="form-row" style="margin-top:12px"><div><label>Nome</label><input type="text" value="${c.name||''}" onchange="configs[${i}].name=this.value"></div><div><label>Instância</label><input type="text" value="${c.instance||''}" onchange="configs[${i}].instance=this.value"></div></div><div class="form-row"><div><label>URL da API</label><input type="text" value="${c.url||''}" onchange="configs[${i}].url=this.value"></div><div><label>API Key</label><input type="password" value="${c.apikey||''}" onchange="configs[${i}].apikey=this.value"></div></div></div></div>`})}
+window.addNewConfig=function(){configs.push({name:'',url:'',apikey:'',instance:'',_tested:null});editingConfigIdx=configs.length-1;renderConfigsTo('adminConfigsList');renderConfigsTo('configsList')};
+window.removeConfig=function(i){if(configs.length<=1)return;configs.splice(i,1);editingConfigIdx=null;renderConfigsTo('adminConfigsList');renderConfigsTo('configsList')};
+window.moveConfigUp=function(i){if(i===0)return;[configs[i-1],configs[i]]=[configs[i],configs[i-1]];renderConfigsTo('adminConfigsList');renderConfigsTo('configsList')};
+window.toggleEditConfig=function(i){editingConfigIdx=editingConfigIdx===i?null:i;renderConfigsTo('adminConfigsList');renderConfigsTo('configsList')};
+window.testConfig=async function(i){const c=configs[i];if(!c.url||!c.apikey||!c.instance){alert('Preencha tudo.');return}
+  try{const res=await fetch(`${c.url.replace(/\/+$/,'')}/instance/fetchInstances`,{headers:{'apikey':c.apikey}});if(!res.ok)throw new Error(`HTTP ${res.status}`);const data=await res.json();const found=Array.isArray(data)?data.some(x=>(x.instance?.instanceName||x.instanceName||x.name)===c.instance):false;configs[i]._tested=found;if(!found){const n=Array.isArray(data)?data.map(x=>x.instance?.instanceName||x.instanceName||x.name).filter(Boolean).join(', '):'';alert(`"${c.instance}" não encontrada.\nDisponíveis: ${n||'nenhuma'}`)}}catch(e){configs[i]._tested=false;alert('Erro: '+e.message)}
+  renderConfigsTo('adminConfigsList');renderConfigsTo('configsList')};
+window.saveAllSettings=async function(){
+  delayMin=parseInt(document.getElementById('globalDelayMin')?.value||document.getElementById('globalDelayMinModal')?.value||'400')||400;
+  delayMax=parseInt(document.getElementById('globalDelayMax')?.value||document.getElementById('globalDelayMaxModal')?.value||'1200')||1200;
+  batchSize=parseInt(document.getElementById('globalBatchSize')?.value||document.getElementById('globalBatchSizeModal')?.value||'50')||50;
+  batchPause=parseInt(document.getElementById('globalBatchPause')?.value||document.getElementById('globalBatchPauseModal')?.value||'120')||120;
+  globalDDD=(document.getElementById('globalDDD')?.value||document.getElementById('globalDDDModal')?.value||'').trim();
+  if(delayMin>delayMax)delayMax=delayMin;
+  if(!configs.some(c=>c.url&&c.apikey&&c.instance)){alert('Salve ao menos uma config.');return}
+  await saveConfigsToFB();syncWindowState();updateHeaderIndicator();updateProcessButton();window.closeSettings();alert('Salvo!')};
+function updateHeaderIndicator(){const dot=document.getElementById('headerDot');const cDot=document.getElementById('headerConnDot');const cTxt=document.getElementById('headerConnText');if(!cDot)return;const v=configs.filter(c=>c.url&&c.apikey&&c.instance);if(v.length===0){if(dot)dot.className='dot';cDot.style.background='var(--text-dark)';cTxt.textContent='Sem config'}else{const ok=v.some(c=>c._tested===true);if(dot)dot.className='dot'+(ok?' on':'');cDot.style.background=ok?'var(--green)':'var(--yellow)';cTxt.textContent=v.length+' config(s)'+(ok?' — OK':'')}}
+function updateProcessButton(){const has=configs.some(c=>c.url&&c.apikey&&c.instance);const file=uploadedData!==null;const btn=document.getElementById('btnProcess');if(btn)btn.disabled=!(has&&file);const h=document.getElementById('processHint');if(!h)return;if(!has&&!file)h.textContent=isMaster()?'Configure API e faça upload.':'Aguardando config de API.';else if(!has)h.textContent=isMaster()?'Configure a API.':'API não configurada.';else if(!file)h.textContent='Faça upload.';else h.textContent='Tudo pronto!'}
+
+// ═══════════════════════════════════════════════
+// ADMIN: MASTER MSG TEMPLATES
+// ═══════════════════════════════════════════════
+function renderMasterMsgTemplates(){const el=document.getElementById('masterMsgList');if(!el)return;el.innerHTML='';
+  const an=document.getElementById('masterAdvogadoName');if(an)an.value=masterAdvogadoName;
+  masterTemplates.forEach((t,i)=>{el.innerHTML+=`<div class="msg-item"><div class="msg-item-header"><input type="text" value="${esc(t.name)}" oninput="masterTemplates[${i}].name=this.value" style="max-width:200px;padding:6px 10px;font-size:12px" placeholder="Nome do modelo"><div class="msg-item-actions">${masterTemplates.length>1?`<button class="config-action-btn del" onclick="removeMasterTpl(${i})">🗑️</button>`:''}</div></div><textarea oninput="masterTemplates[${i}].text=this.value" placeholder="Texto da mensagem...">${esc(t.text)}</textarea></div>`})}
+function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+window.addMasterTemplate=function(){masterTemplates.push({name:'Modelo '+(masterTemplates.length+1),text:''});renderMasterMsgTemplates()};
+window.removeMasterTpl=function(i){if(masterTemplates.length<=1)return;masterTemplates.splice(i,1);renderMasterMsgTemplates()};
+window.saveMasterMsgSettings=async function(){
+  const list=document.getElementById('masterMsgList');if(list){
+    const items=list.querySelectorAll('.msg-item');items.forEach((item,i)=>{if(i<masterTemplates.length){
+      const nameInput=item.querySelector('input[type="text"]');if(nameInput)masterTemplates[i].name=nameInput.value;
+      const ta=item.querySelector('textarea');if(ta)masterTemplates[i].text=ta.value}})}
+  masterAdvogadoName=(document.getElementById('masterAdvogadoName')?.value||'').trim();
+  await saveMasterMsgsToFB();syncWindowState();alert('Templates salvos!');
+};
+
+// ═══════════════════════════════════════════════
+// USER MSG SETTINGS
+// ═══════════════════════════════════════════════
+window.openMsgSettings=async function(){
+  const mtDoc=await fbGetDoc('settings/masterTemplates');
+  masterTemplates.length=0;
+  if(mtDoc&&mtDoc.templates&&mtDoc.templates.length>0){mtDoc.templates.forEach(t=>masterTemplates.push(t));masterAdvogadoName=mtDoc.advogado||''}
+  if(masterTemplates.length===0){masterTemplates.push({name:'Modelo 1',text:'Olá.\nGostaria de falar com o {NOME_CLIENTE}\n\nMe chamo {NOME_ADVOGADO}'});masterTemplates.push({name:'Modelo 2',text:'Boa tarde!\nEstou buscando contato com {NOME_CLIENTE}.\n\nMeu nome é {NOME_ADVOGADO}, tudo bem?'});masterTemplates.push({name:'Modelo 3',text:'Olá, boa tarde.\nVocê é {NOME_CLIENTE}?\n\nSou {NOME_ADVOGADO}, gostaria de conversar com você.'});}
+  syncWindowState();
+  document.getElementById('msgOverlay').classList.add('show');
+  document.getElementById('userAdvogadoName').value=userAdvogadoName||masterAdvogadoName;
+  renderUserMsgList();
+};
+window.closeMsgSettings=function(){document.getElementById('msgOverlay').classList.remove('show')};
+function renderUserMsgList(){const el=document.getElementById('userMsgList');el.innerHTML='';
+  if(masterTemplates.length>0){el.innerHTML+='<p style="font-size:11px;color:var(--text-dim);margin-bottom:8px">📌 Templates do administrador:</p>';
+    masterTemplates.forEach((t,i)=>{const checked=enabledMasterIdx.includes(i)?'checked':'';const hasOverride=masterOverrides[i]!=null;const displayText=hasOverride?masterOverrides[i]:t.text;const resetBtn=hasOverride?`<button class="config-action-btn" onclick="resetMasterOverride(${i})" style="font-size:10px">↩️</button>`:'';const editedBadge=hasOverride?'<span style="font-size:9px;background:var(--orange-glow);color:var(--orange);padding:2px 6px;border-radius:4px;margin-left:6px">editado</span>':'';
+      el.innerHTML+=`<div class="msg-item" data-master="${i}"><div class="msg-item-header"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;font-weight:600"><input type="checkbox" ${checked} onchange="toggleMasterTpl(${i},this.checked)" style="width:16px;height:16px;accent-color:var(--orange);cursor:pointer"> 📌 ${esc(t.name)}${editedBadge}</label><div class="msg-item-actions">${resetBtn}</div></div><textarea oninput="setMasterOverride(${i},this.value)">${esc(displayText)}</textarea></div>`})}
+  el.innerHTML+='<p style="font-size:11px;color:var(--text-dim);margin:14px 0 8px">✏️ Seus templates pessoais:</p>';
+  userTemplates.forEach((t,i)=>{const checked=t.enabled!==false?'checked':'';
+    el.innerHTML+=`<div class="msg-item" data-user="${i}"><div class="msg-item-header"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" ${checked} onchange="userTemplates[${i}].enabled=this.checked" style="width:16px;height:16px;accent-color:var(--orange);cursor:pointer"> <input type="text" value="${esc(t.name)}" oninput="userTemplates[${i}].name=this.value" style="max-width:200px;padding:6px 10px;font-size:12px"></label><div class="msg-item-actions"><button class="config-action-btn del" onclick="removeUserTpl(${i})">🗑️</button></div></div><textarea oninput="userTemplates[${i}].text=this.value">${esc(t.text)}</textarea></div>`})}
+window.setMasterOverride=function(idx,val){const orig=masterTemplates[idx]?.text||'';if(val.trim()===orig.trim()){delete masterOverrides[idx]}else{masterOverrides[idx]=val}};
+window.resetMasterOverride=function(idx){delete masterOverrides[idx];renderUserMsgList()};
+window.toggleMasterTpl=function(idx,checked){if(checked){if(!enabledMasterIdx.includes(idx))enabledMasterIdx.push(idx)}else{enabledMasterIdx=enabledMasterIdx.filter(i=>i!==idx)}};
+window.addUserTemplate=function(){userTemplates.push({name:'Meu modelo '+(userTemplates.length+1),text:'',enabled:true});renderUserMsgList()};
+window.removeUserTpl=function(i){userTemplates.splice(i,1);renderUserMsgList()};
+window.saveUserMsgSettings=async function(){
+  const list=document.getElementById('userMsgList');if(list){
+    list.querySelectorAll('[data-user]').forEach(item=>{const idx=parseInt(item.dataset.user);if(idx<userTemplates.length){const nameInput=item.querySelector('input[type="text"]');if(nameInput)userTemplates[idx].name=nameInput.value;const ta=item.querySelector('textarea');if(ta)userTemplates[idx].text=ta.value;const cb=item.querySelector('input[type="checkbox"]');if(cb)userTemplates[idx].enabled=cb.checked}});
+    list.querySelectorAll('[data-master]').forEach(item=>{const idx=parseInt(item.dataset.master);const ta=item.querySelector('textarea');if(ta){const val=ta.value;const orig=masterTemplates[idx]?.text||'';if(val.trim()!==orig.trim())masterOverrides[idx]=val;else delete masterOverrides[idx]}const cb=item.querySelector('input[type="checkbox"]');if(cb){if(cb.checked){if(!enabledMasterIdx.includes(idx))enabledMasterIdx.push(idx)}else{enabledMasterIdx=enabledMasterIdx.filter(i=>i!==idx)}}});
+  }
+  userAdvogadoName=(document.getElementById('userAdvogadoName')?.value||'').trim();
+  await saveUserPrefsToFB();syncWindowState();window.closeMsgSettings();
+};
+function getAllTemplates(){
+  const enabled=[];
+  masterTemplates.forEach((t,i)=>{if(enabledMasterIdx.includes(i)){const text=masterOverrides[i]!=null?masterOverrides[i]:t.text;if(text?.trim())enabled.push({name:t.name,text})}});
+  const userEnabled=userTemplates.filter(t=>t.enabled!==false&&t.text?.trim());
+  return[...enabled,...userEnabled]
+}
+function getNextTemplate(){const all=getAllTemplates();if(all.length===0)return'Olá, gostaria de falar com você.';const t=all[templateRotationIdx%all.length];templateRotationIdx++;return t.text}
+function buildMessage(tpl,clientName,chamado){return tpl.replace(/\{NOME_CLIENTE\}/g,clientName).replace(/\{NOME_ADVOGADO\}/g,userAdvogadoName||masterAdvogadoName||'Advogado').replace(/\{CHAMADO\}/g,chamado||'')}
+
+// ═══════════════════════════════════════════════
+// ADMIN TABS
+// ═══════════════════════════════════════════════
+window.switchAdminTab=function(panel,btn){document.querySelectorAll('.admin-tab').forEach(t=>t.classList.remove('active'));btn.classList.add('active');document.querySelectorAll('.admin-panel').forEach(p=>p.classList.remove('active'));
+  const capPanel=panel.charAt(0).toUpperCase()+panel.slice(1);
+  document.getElementById('panel'+capPanel).classList.add('active');
+  if(panel==='apiconf'){const f=id=>{const e=document.getElementById(id);return e};f('globalDelayMin').value=delayMin;f('globalDelayMax').value=delayMax;f('globalBatchSize').value=batchSize;f('globalBatchPause').value=batchPause;f('globalDDD').value=globalDDD;renderAdminConfigs()}
+  if(panel==='msgtpl')renderMasterMsgTemplates();if(panel==='audit')renderAuditLog();if(panel==='users')renderUsersList();if(panel==='whatsconn')renderWhatsConnPanel()};
+
+// ═══════════════════════════════════════════════
+// FILE UPLOAD
+// ═══════════════════════════════════════════════
+(function setupDragDrop(){const dz=document.getElementById('dropZone');if(!dz)return;dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover')});dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');if(e.dataTransfer.files.length){document.getElementById('fileInput').files=e.dataTransfer.files;window.handleFile({target:{files:e.dataTransfer.files}})}})})();
+window.handleFile=function(e){const file=e.target.files[0];if(!file)return;document.getElementById('fileName').textContent=file.name;document.getElementById('fileSize').textContent=(file.size/1024).toFixed(1)+' KB';document.getElementById('fileInfo').classList.add('show');const reader=new FileReader();reader.onload=function(ev){const data=new Uint8Array(ev.target.result);const wb=XLSX.read(data,{type:'array'});const sheet=wb.Sheets[wb.SheetNames[0]];const json=XLSX.utils.sheet_to_json(sheet,{defval:''});if(json.length===0){alert('Vazia!');return}uploadedData=json;headers=Object.keys(json[0]);['colChamado','colName','colPhones'].forEach(id=>{const sel=document.getElementById(id);sel.innerHTML='<option value="">— Selecione —</option>';headers.forEach(h=>{sel.innerHTML+=`<option value="${h}">${h}</option>`})});headers.forEach(h=>{const hl=h.toLowerCase();if(hl.includes('protocolo')||hl.includes('chamado')||hl.includes('ticket'))document.getElementById('colChamado').value=h;if(hl.includes('nome cliente')||hl.includes('nome_cliente')){document.getElementById('colName').value=h}else if(!document.getElementById('colName').value&&(hl.includes('nome')||hl.includes('name')||hl.includes('cliente')))document.getElementById('colName').value=h;if(hl.includes('tel')||hl.includes('phone')||hl.includes('fone')||hl.includes('cel')||hl.includes('whats'))document.getElementById('colPhones').value=h});document.getElementById('columnMapping').classList.add('show');updateProcessButton();log('Arquivo: '+json.length+' linhas','info')};reader.readAsArrayBuffer(file)};
+window.removeFile=function(){uploadedData=null;headers=[];document.getElementById('fileInfo').classList.remove('show');document.getElementById('columnMapping').classList.remove('show');document.getElementById('fileInput').value='';updateProcessButton()};
+
+// ═══════════════════════════════════════════════
+// PHONE / LOG UTILS
+// ═══════════════════════════════════════════════
+function normalizePhone(phone,ddd){let p=phone.replace(/[\s\-\(\)\.\+]/g,'').replace(/\D/g,'');if(!p)return null;if(p.startsWith('55')&&p.length>=12){}else if(p.length===11)p='55'+p;else if(p.length===10)p='55'+p;else if(p.length===9&&ddd)p='55'+ddd+p;else if(p.length===8&&ddd)p='55'+ddd+p;else if(p.length<8||p.length>15)return null;if(p.length<12||p.length>13)return null;if(p.length===12){const loc=p.substring(4);if(['9','8','7','6'].includes(loc.charAt(0)))p=p.substring(0,4)+'9'+loc}return p}
+function formatName(name){if(!name)return'';return name.toLowerCase().split(/\s+/).map(w=>{if(['de','da','do','dos','das','e','a','o'].includes(w))return w;return w.charAt(0).toUpperCase()+w.slice(1)}).join(' ')}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+function randDelay(){return Math.floor(Math.random()*(delayMax-delayMin+1))+delayMin}
+
+async function batchPauseCountdown(seconds){
+  const el=document.getElementById('batchPauseOverlay');if(el)el.classList.add('show');
+  const txt=document.getElementById('batchPauseText');const bar=document.getElementById('batchPauseBar');
+  for(let s=seconds;s>0;s--){const m=Math.floor(s/60);const sec=s%60;if(txt)txt.textContent=`${m}:${String(sec).padStart(2,'0')}`;if(bar)bar.style.width=((seconds-s)/seconds*100)+'%';log(`⏸ Pausa: ${m}:${String(sec).padStart(2,'0')} restantes`,'info');await sleep(1000)}
+  if(el)el.classList.remove('show')
+}
+function log(msg,type=''){const a=document.getElementById('logArea');if(!a)return;const l=document.createElement('div');l.className='log-line '+type;l.textContent=`[${new Date().toLocaleTimeString()}] ${msg}`;a.appendChild(l);a.scrollTop=a.scrollHeight}
+
+// ═══════════════════════════════════════════════
+// EVOLUTION API
+// ═══════════════════════════════════════════════
+async function fetchWithTimeout(url,opts,timeoutMs=15000){
+  const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),timeoutMs);
+  try{const res=await fetch(url,{...opts,signal:ctrl.signal});clearTimeout(timer);return res}catch(e){clearTimeout(timer);throw e}
+}
+async function checkWA(phone){
+  const vc=configs.filter(c=>c.url&&c.apikey&&c.instance);
+  for(let ci=0;ci<vc.length;ci++){
+    const c=vc[ci];
+    for(let attempt=1;attempt<=3;attempt++){
+      try{
+        const res=await fetchWithTimeout(`${c.url.replace(/\/+$/,'')}/chat/whatsappNumbers/${c.instance}`,{method:'POST',headers:{'Content-Type':'application/json','apikey':c.apikey},body:JSON.stringify({numbers:[phone]})});
+        if(!res.ok)throw new Error(`HTTP ${res.status}`);
+        const data=await res.json();
+        if(Array.isArray(data)&&data[0])return{exists:data[0].exists===true||data[0].exists==='true',cfg:c.name||`Config ${ci+1}`};
+        return{exists:false,cfg:c.name||`Config ${ci+1}`}
+      }catch(e){
+        const isLast=attempt===3;
+        if(!isLast){await sleep(3000*attempt)}else{if(ci<vc.length-1){break}else throw new Error(`Falha após 3 tentativas: ${e.message}`)}
+      }
+    }
+  }
+  throw new Error('Todas as configs falharam')
+}
+
+// ═══════════════════════════════════════════════
+// WHATSAPP CONNECT VIA QR CODE (Evolution API)
+// ═══════════════════════════════════════════════
+async function renderWhatsConnPanel(){
+  const el=document.getElementById('panelWhatsconn');if(!el)return;
+  const c=configs.find(x=>x.url&&x.apikey&&x.instance);
+  if(!c){el.innerHTML='<div class="card"><div class="info-banner">⚠️ Configure uma instância Evolution API primeiro na aba API.</div></div>';return}
+  // Check current connection status
+  let statusHtml='';
+  try{
+    const res=await fetchWithTimeout(`${c.url.replace(/\/+$/,'')}/instance/connectionState/${c.instance}`,{headers:{'apikey':c.apikey}});
+    const data=await res.json();
+    const state=data?.instance?.state||data?.state||'unknown';
+    evolutionConnected=state==='open';
+    const stateLabel={open:'🟢 Conectado',close:'🔴 Desconectado',connecting:'🟡 Conectando',unknown:'⚪ Desconhecido'}[state]||state;
+    statusHtml=`<div class="conn-status-badge ${evolutionConnected?'connected':'disconnected'}">${stateLabel}</div>`;
+  }catch(e){statusHtml=`<div class="conn-status-badge disconnected">⚠️ Erro ao verificar status</div>`}
+
+  el.innerHTML=`
+  <div class="card">
+    <div class="card-title">📱 Conexão WhatsApp — ${esc(c.name||c.instance)}</div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+      ${statusHtml}
+      <button class="btn btn-secondary btn-small" onclick="refreshWhatsConnStatus()">🔄 Atualizar</button>
+      ${evolutionConnected?`<button class="btn-danger" onclick="disconnectWhatsApp()" style="padding:7px 14px;font-size:11px;border-radius:8px">⏏️ Desconectar</button>`:''}
+    </div>
+    ${!evolutionConnected?`
+    <div class="info-banner">Escaneie o QR Code com o WhatsApp Business para conectar a instância <strong>${esc(c.instance)}</strong>.</div>
+    <div style="text-align:center;margin:20px 0">
+      <div id="qrCodeArea" style="min-height:260px;display:flex;align-items:center;justify-content:center;background:var(--bg);border-radius:16px;border:1px dashed var(--border);margin-bottom:16px">
+        <div style="color:var(--text-dim);font-size:13px">Clique em <strong>Gerar QR Code</strong> para começar</div>
+      </div>
+      <button class="btn btn-primary" id="btnGenQR" onclick="generateQRCode()">📲 Gerar QR Code</button>
+    </div>
+    `:`
+    <div class="info-banner" style="border-color:rgba(37,211,102,.3);background:rgba(37,211,102,.06)">✅ WhatsApp conectado! As mensagens recebidas aparecerão no sistema de mensageria.</div>
+    `}
+  </div>`;
+}
+
+window.refreshWhatsConnStatus=async function(){await renderWhatsConnPanel()};
+
+window.generateQRCode=async function(){
+  const c=configs.find(x=>x.url&&x.apikey&&x.instance);if(!c)return;
+  const btn=document.getElementById('btnGenQR');
+  if(btn){btn.disabled=true;btn.textContent='⏳ Gerando...'}
+  const area=document.getElementById('qrCodeArea');
+  if(area)area.innerHTML='<div style="color:var(--text-dim)">⏳ Aguarde...</div>';
+  try{
+    // First try to connect the instance
+    const connectRes=await fetchWithTimeout(`${c.url.replace(/\/+$/,'')}/instance/connect/${c.instance}`,{method:'GET',headers:{'apikey':c.apikey}});
+    const connectData=await connectRes.json();
+    const qrBase64=connectData?.base64||connectData?.qrcode?.base64||connectData?.qr;
+    if(qrBase64){
+      displayQRCode(qrBase64);
+      startQRPolling(c);
+    }else{
+      // Try direct QR endpoint
+      const qrRes=await fetchWithTimeout(`${c.url.replace(/\/+$/,'')}/instance/qrcode/${c.instance}?image=true`,{headers:{'apikey':c.apikey}});
+      const qrData=await qrRes.json();
+      const qr=qrData?.base64||qrData?.qrcode?.base64;
+      if(qr){displayQRCode(qr);startQRPolling(c);}
+      else{if(area)area.innerHTML='<div style="color:var(--red)">❌ Não foi possível obter o QR Code. Verifique se a instância está configurada corretamente.</div>';}
+    }
+  }catch(e){if(area)area.innerHTML=`<div style="color:var(--red)">❌ Erro: ${e.message}</div>`;}
+  finally{if(btn){btn.disabled=false;btn.textContent='📲 Gerar QR Code'}}
+};
+
+function displayQRCode(base64){
+  const area=document.getElementById('qrCodeArea');
+  if(!area)return;
+  const src=base64.startsWith('data:')?base64:`data:image/png;base64,${base64}`;
+  area.innerHTML=`
+    <div style="text-align:center">
+      <img src="${src}" style="width:240px;height:240px;border-radius:12px;border:4px solid var(--surface2)" alt="QR Code WhatsApp">
+      <p style="font-size:11px;color:var(--text-dim);margin-top:10px">Escaneie com o WhatsApp Business<br><span style="color:var(--orange)">O QR Code expira em 60 segundos</span></p>
+    </div>`;
+}
+
+function startQRPolling(c){
+  if(qrPollingInterval)clearInterval(qrPollingInterval);
+  let attempts=0;
+  qrPollingInterval=setInterval(async()=>{
+    attempts++;
+    if(attempts>20){clearInterval(qrPollingInterval);qrPollingInterval=null;return}
+    try{
+      const res=await fetchWithTimeout(`${c.url.replace(/\/+$/,'')}/instance/connectionState/${c.instance}`,{headers:{'apikey':c.apikey}});
+      const data=await res.json();
+      const state=data?.instance?.state||data?.state;
+      if(state==='open'){
+        clearInterval(qrPollingInterval);qrPollingInterval=null;
+        evolutionConnected=true;
+        const area=document.getElementById('qrCodeArea');
+        if(area)area.innerHTML='<div style="color:var(--green);font-size:32px;text-align:center">✅<br><span style="font-size:14px">WhatsApp conectado com sucesso!</span></div>';
+        setTimeout(()=>renderWhatsConnPanel(),2000);
+      }
+    }catch(e){}
+  },3000);
+}
+
+window.disconnectWhatsApp=async function(){
+  if(!confirm('Desconectar o WhatsApp desta instância?'))return;
+  const c=configs.find(x=>x.url&&x.apikey&&x.instance);if(!c)return;
+  try{
+    await fetchWithTimeout(`${c.url.replace(/\/+$/,'')}/instance/logout/${c.instance}`,{method:'DELETE',headers:{'apikey':c.apikey}});
+    evolutionConnected=false;
+    await renderWhatsConnPanel();
+  }catch(e){alert('Erro ao desconectar: '+e.message)}
+};
+
+// ═══════════════════════════════════════════════
+// QUICK CHECK
+// ═══════════════════════════════════════════════
+let quickHistory=[];
+window.quickCheck=async function(){
+  const raw=document.getElementById('quickPhone').value.trim();
+  const name=document.getElementById('quickName').value.trim();
+  if(!raw){alert('Digite um número.');return}
+  const norm=normalizePhone(raw,globalDDD);
+  if(!norm){showQuickResult('invalid',raw,name,'Número inválido. Verifique o formato.');return}
+  if(!configs.some(c=>c.url&&c.apikey&&c.instance)){alert(isMaster()?'Configure a API primeiro.':'API não configurada. Contate o admin.');return}
+  showQuickResult('checking',norm,name,'Consultando...');
+  document.getElementById('btnQuickCheck').disabled=true;document.getElementById('btnQuickCheck').textContent='⏳ Validando...';
+  try{
+    const r=await checkWA(norm);
+    if(r.exists){showQuickResult('wa',norm,name,`✓ Possui WhatsApp [${r.cfg}]`);addQuickHistory(norm,name,true)}
+    else{showQuickResult('nowa',norm,name,'✗ Não possui WhatsApp');addQuickHistory(norm,name,false)}
+    await addAudit('validation',`Consulta rápida: ${name||'—'} (${norm}) → ${r.exists?'WhatsApp':'Sem WhatsApp'}`);
+  }catch(e){showQuickResult('nowa',norm,name,'❌ Erro: '+e.message)}
+  finally{document.getElementById('btnQuickCheck').disabled=false;document.getElementById('btnQuickCheck').textContent='🔍 Validar'}
+};
+function showQuickResult(type,phone,name,msg){
+  const el=document.getElementById('quickResult');el.style.display='block';
+  if(type==='checking')el.innerHTML=`<div class="qr-result checking"><div class="qr-icon">⏳</div><div class="qr-info"><div class="qr-phone">${phone}</div><div class="qr-status load">${msg}</div></div></div>`;
+  else if(type==='wa')el.innerHTML=`<div class="qr-result is-wa"><div class="qr-icon">✅</div><div class="qr-info"><div class="qr-phone">${phone}</div>${name?`<div style="font-size:11px;color:var(--text-dim)">${formatName(name)}</div>`:''}<div class="qr-status ok">${msg}</div></div><button class="btn-whatsapp" onclick="quickSendWA('${phone}','${(name||'').replace(/'/g,'')}')">📨 Enviar</button></div>`;
+  else if(type==='nowa')el.innerHTML=`<div class="qr-result no-wa"><div class="qr-icon">❌</div><div class="qr-info"><div class="qr-phone">${phone}</div>${name?`<div style="font-size:11px;color:var(--text-dim)">${formatName(name)}</div>`:''}<div class="qr-status fail">${msg}</div></div></div>`;
+  else if(type==='invalid')el.innerHTML=`<div class="qr-result no-wa"><div class="qr-icon">⚠️</div><div class="qr-info"><div class="qr-phone">${phone}</div><div class="qr-status fail">${msg}</div></div></div>`;
+}
+window.quickSendWA=async function(phone,name){
+  const tpl=getNextTemplate();const msg=buildMessage(tpl,name||'','');
+  window.open(`https://wa.me/${phone}?text=${encodeURIComponent(msg)}`,'_blank');
+  await addAudit('send',`Consulta rápida → Msg enviada para ${name||'—'} (${phone})`);
+};
+function addQuickHistory(phone,name,isWA){const time=new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});quickHistory.unshift({phone,name,isWA,time});if(quickHistory.length>10)quickHistory=quickHistory.slice(0,10);renderQuickHistory()}
+function renderQuickHistory(){const el=document.getElementById('quickHistory');if(!el||quickHistory.length===0)return;el.innerHTML='<p style="font-size:10px;color:var(--text-dark);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Histórico desta sessão</p>';el.innerHTML+=quickHistory.map(h=>{const icon=h.isWA?'✅':'❌';const sendBtn=h.isWA?`<button class="btn-whatsapp" style="padding:3px 10px;font-size:10px" onclick="quickSendWA('${h.phone}','${(h.name||'').replace(/'/g,'')}')">📨</button>`:'';return`<div class="qr-history-item"><span class="qr-h-icon">${icon}</span><span class="qr-h-phone">${h.phone}</span><span class="qr-h-name">${h.name?formatName(h.name):'—'}</span>${sendBtn}<span class="qr-h-time">${h.time}</span></div>`}).join('')}
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&document.activeElement&&(document.activeElement.id==='quickPhone'||document.activeElement.id==='quickName'))window.quickCheck()});
+
+// ═══════════════════════════════════════════════
+// PROCESSING
+// ═══════════════════════════════════════════════
+window.startProcessing=async function(){const ck=document.getElementById('colChamado').value,nk=document.getElementById('colName').value,pk=document.getElementById('colPhones').value;if(!pk){alert('Selecione telefones!');return}if(!nk){alert('Selecione nome!');return}
+  document.getElementById('btnProcess').disabled=true;document.getElementById('progressSection').classList.add('show');document.getElementById('resultSection').classList.remove('show');document.getElementById('logArea').innerHTML='';
+  validResultData=[];allResultData=[];sendTracker={};let totalPhones=0,validCount=0,invalidCount=0,dupCount=0;const seenGlobal=new Set();
+  const rows=[];for(const row of uploadedData){const chamado=String(row[ck]||'').trim(),name=String(row[nk]||'').trim(),phonesRaw=String(row[pk]||''),phones=phonesRaw.split(/[,;\/\|]+/).map(p=>p.trim()).filter(Boolean);rows.push({chamado,name,phones});totalPhones+=phones.length}
+  document.getElementById('statTotal').textContent=totalPhones;log(`Iniciando: ${totalPhones} números, ${rows.length} contatos`,'info');
+  let processed=0,apiCalls=0;
+  for(const{chamado,name,phones}of rows){const validPhones=[],allPhonesResult=[],seenLocal=new Set();
+    for(const rawPhone of phones){const norm=normalizePhone(rawPhone,globalDDD);if(!norm){log(`${formatName(name)}: "${rawPhone}" → inválido`,'fail');invalidCount++;allPhonesResult.push({number:rawPhone,isWA:false});processed++;updProg(processed,totalPhones,validCount,invalidCount,dupCount);continue}
+      if(seenGlobal.has(norm)||seenLocal.has(norm)){log(`${formatName(name)}: ${norm} → duplicado`,'warn');dupCount++;processed++;updProg(processed,totalPhones,validCount,invalidCount,dupCount);continue}seenLocal.add(norm);
+      if(apiCalls>0&&apiCalls%batchSize===0){log(`⏸ Lote de ${batchSize} concluído. Pausando ${batchPause}s...`,'switch');await batchPauseCountdown(batchPause);log(`▶ Retomando...`,'info')}
+      try{const r=await checkWA(norm);apiCalls++;if(r.exists){log(`${formatName(name)}: ${norm} → ✓ [${r.cfg}]`,'ok');validPhones.push(norm);seenGlobal.add(norm);validCount++;allPhonesResult.push({number:norm,isWA:true})}else{log(`${formatName(name)}: ${norm} → ✗`,'fail');invalidCount++;seenGlobal.add(norm);allPhonesResult.push({number:norm,isWA:false})}}catch(e){apiCalls++;log(`${formatName(name)}: ${norm} → ❌ Erro: ${e.message}`,'fail');invalidCount++;allPhonesResult.push({number:norm,isWA:false,error:true})}
+      processed++;updProg(processed,totalPhones,validCount,invalidCount,dupCount);await sleep(randDelay())}
+    if(validPhones.length>0)validResultData.push({chamado,name:formatName(name),phones:validPhones});if(allPhonesResult.length>0)allResultData.push({chamado,name:formatName(name),phones:allPhonesResult})}
+  log(`✅ ${validCount} válidos, ${invalidCount} inválidos, ${dupCount} dup.`,'info');
+  const reportRows=[];allResultData.forEach(row=>{row.phones.forEach(p=>{reportRows.push({chamado:row.chamado,nome:row.name,telefone:p.number,whatsapp:p.isWA?'Sim':'Não'})})});
+  await addAudit('validation',`${totalPhones} números: ${validCount} válidos, ${invalidCount} inválidos, ${dupCount} dup.`,reportRows);
+  document.getElementById('resultSection').classList.add('show');document.getElementById('resultSummary').textContent=`${validCount} válidos de ${totalPhones}. ${dupCount} duplicados.`;document.getElementById('btnProcess').disabled=false};
+function updProg(c,t,v,i,d){const p=t>0?Math.round((c/t)*100):0;document.getElementById('progressBar').style.width=p+'%';document.getElementById('progressText').textContent=c+'/'+t;document.getElementById('progressPercent').textContent=p+'%';document.getElementById('statValid').textContent=v;document.getElementById('statInvalid').textContent=i;document.getElementById('statDup').textContent=d}
+
+// ═══════════════════════════════════════════════
+// SEND TABLE
+// ═══════════════════════════════════════════════
+window.goToSendPage=function(){showPage('pageSend')};
+function renderSendTable(){const maxP=Math.max(...validResultData.map(r=>r.phones.length),0);let hh='<tr><th>Chamado</th><th>Nome</th>';for(let i=1;i<=maxP;i++)hh+=`<th>Tel ${i}</th><th></th><th>Hora</th>`;hh+='</tr>';document.getElementById('sendTableHead').innerHTML=hh;
+  let bb='',sC=0,pC=0;validResultData.forEach((row,ri)=>{bb+='<tr>';bb+=`<td class="td-chamado">${row.chamado}</td><td class="td-name">${row.name}</td>`;for(let pi=0;pi<maxP;pi++){const phone=row.phones[pi]||'',key=ri+'-'+pi,tr=sendTracker[key];if(phone){bb+=`<td class="td-phone">${phone}</td>`;if(tr){bb+=`<td><span class="sent-badge">✓</span></td><td class="td-datetime">${tr.dt}</td>`;sC++}else{bb+=`<td><button class="btn-whatsapp" onclick="sendWA(${ri},${pi})">📨</button></td><td></td>`;pC++}}else bb+='<td></td><td></td><td></td>'}bb+='</tr>'});
+  document.getElementById('sendTableBody').innerHTML=bb;document.getElementById('sendStatTotal').textContent=validResultData.length;document.getElementById('sendStatSent').textContent=sC;document.getElementById('sendStatPending').textContent=pC}
+window.sendWA=async function(ri,pi){if(!hasPerm('canSendMessages')){alert('Sem permissão para enviar mensagens.');return}const row=validResultData[ri];if(!row?.phones[pi])return;const phone=row.phones[pi],msg=buildMessage(getNextTemplate(),row.name,row.chamado);window.open(`https://wa.me/${phone}?text=${encodeURIComponent(msg)}`,'_blank');const now=new Date();const dt=now.toLocaleDateString('pt-BR')+' '+now.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});sendTracker[ri+'-'+pi]={dt};await addAudit('send',`Msg → ${row.name} (${phone})`);renderSendTable()};
+
+window.downloadResult=function(){const wb=XLSX.utils.book_new();
+  const maxVP=Math.max(...validResultData.map(r=>r.phones.length),0);const h1=['Chamado','Nome'];for(let i=1;i<=maxVP;i++)h1.push('Telefone '+i,'Status','Data/Hora');const s1=[h1];validResultData.forEach((row,ri)=>{const r=[row.chamado,row.name];for(let pi=0;pi<maxVP;pi++){const phone=row.phones[pi]||'',t=sendTracker[ri+'-'+pi];r.push(phone,t?'Enviado':'',t?t.dt:'')}s1.push(r)});const ws1=XLSX.utils.aoa_to_sheet(s1);XLSX.utils.book_append_sheet(wb,ws1,'Válidos');
+  XLSX.writeFile(wb,`expansao_${new Date().toISOString().slice(0,10)}.xlsx`)};
+
+// ═══════════════════════════════════════════════
+// ════════════════════════════════════════════════
+// MESSAGING SYSTEM
+// ════════════════════════════════════════════════
+// ═══════════════════════════════════════════════
+
+// Listener for conversations in real-time
+function startConvListener(){
+  if(convListenerUnsub)convListenerUnsub();
+  const colRef=collection(db,'conversations');
+  convListenerUnsub=onSnapshot(colRef,(snap)=>{
+    conversations=snap.docs.map(d=>({id:d.id,...d.data()}));
+    conversations.sort((a,b)=>(b.lastMessageAt?.seconds||0)-(a.lastMessageAt?.seconds||0));
+    // Update badge
+    const unread=conversations.filter(c=>c.unreadCount>0).length;
+    const badge=document.getElementById('msgBadge');
+    if(badge){badge.textContent=unread>0?unread:'';badge.style.display=unread>0?'flex':'none'}
+    // If messaging page is active, refresh list
+    if(document.getElementById('pageMessaging')?.classList.contains('active')){
+      renderConversationList();
+    }
+  });
+}
+
+function renderConversationList(){
+  const el=document.getElementById('convList');if(!el)return;
+  const search=(document.getElementById('convSearch')?.value||'').toLowerCase();
+  const filtered=search?conversations.filter(c=>(c.contactName||c.phone||'').toLowerCase().includes(search)):conversations;
+  if(filtered.length===0){el.innerHTML=`<div class="conv-empty"><div style="font-size:32px;margin-bottom:12px">💬</div><div>Nenhuma conversa ainda.</div><div style="font-size:11px;margin-top:6px;color:var(--text-dark)">As mensagens recebidas via Evolution API aparecerão aqui.</div></div>`;return}
+  el.innerHTML=filtered.map(c=>{
+    const isActive=c.id===activeConvId;
+    const lastMsg=c.lastMessage?truncate(c.lastMessage,45):'';
+    const lastTime=c.lastMessageAt?formatMsgTime(c.lastMessageAt.toDate?c.lastMessageAt.toDate():new Date(c.lastMessageAt)):'';
+    const avatar=getInitials(c.contactName||c.phone||'?');
+    const unread=c.unreadCount>0?`<span class="unread-badge">${c.unreadCount}</span>`:'';
+    const kanbanCol=c.kanbanColumn||'novo';
+    const colColor={novo:'var(--blue)',emAndamento:'var(--yellow)',aguardando:'var(--orange)',resolvido:'var(--green)',arquivado:'var(--text-dark)'}[kanbanCol]||'var(--text-dark)';
+    return`<div class="conv-item ${isActive?'active':''}" onclick="openConversation('${c.id}')">
+      <div class="conv-avatar" style="background:${stringToColor(c.contactName||c.phone||'?')}">${avatar}</div>
+      <div class="conv-info">
+        <div class="conv-header-row">
+          <span class="conv-name">${esc(c.contactName||formatPhone(c.phone)||'Desconhecido')}</span>
+          <span class="conv-time">${lastTime}</span>
+        </div>
+        <div class="conv-last-row">
+          <span class="conv-last">${esc(lastMsg)}</span>
+          <div style="display:flex;gap:5px;align-items:center">
+            <span class="kanban-pill" style="background:${colColor}20;color:${colColor};border-color:${colColor}40">${getKanbanLabel(kanbanCol)}</span>
+            ${unread}
+          </div>
+        </div>
+      </div>
+    </div>`
+  }).join('');
+}
+
+async function openConversation(convId){
+  activeConvId=convId;
+  // Mark as read
+  const conv=conversations.find(c=>c.id===convId);
+  if(conv&&conv.unreadCount>0){await fbUpdateDoc('conversations/'+convId,{unreadCount:0})}
+  // Update active state visually
+  document.querySelectorAll('.conv-item').forEach(el=>el.classList.toggle('active',el.onclick?.toString().includes(convId)));
+  renderConversationList();
+  // Start message listener
+  if(msgListenerUnsub)msgListenerUnsub();
+  const msgColRef=collection(db,'conversations/'+convId+'/messages');
+  const msgQuery=query(msgColRef,orderBy('timestamp','asc'));
+  msgListenerUnsub=onSnapshot(msgQuery,(snap)=>{
+    const messages=snap.docs.map(d=>({id:d.id,...d.data()}));
+    renderMessages(messages,conv||conversations.find(c=>c.id===convId));
+  });
+  renderChatHeader(conv);
+}
+window.openConversation=openConversation;
+
+function renderChatHeader(conv){
+  const el=document.getElementById('chatHeader');if(!el||!conv)return;
+  const kanbanCol=conv.kanbanColumn||'novo';
+  el.innerHTML=`
+    <div class="chat-hdr-left">
+      <div class="conv-avatar sm" style="background:${stringToColor(conv.contactName||conv.phone||'?')}">${getInitials(conv.contactName||conv.phone||'?')}</div>
+      <div>
+        <div class="chat-name">${esc(conv.contactName||formatPhone(conv.phone)||'Desconhecido')}</div>
+        <div class="chat-phone">${conv.phone||''}</div>
+      </div>
+    </div>
+    <div class="chat-hdr-right">
+      <select class="kanban-select" onchange="moveConvToKanban('${conv.id}',this.value)" ${!hasPerm('canMoveKanban')?'disabled':''}>
+        <option value="novo" ${kanbanCol==='novo'?'selected':''}>🔵 Novo</option>
+        <option value="emAndamento" ${kanbanCol==='emAndamento'?'selected':''}>🟡 Em andamento</option>
+        <option value="aguardando" ${kanbanCol==='aguardando'?'selected':''}>🟠 Aguardando</option>
+        <option value="resolvido" ${kanbanCol==='resolvido'?'selected':''}>🟢 Resolvido</option>
+        <option value="arquivado" ${kanbanCol==='arquivado'?'selected':''}>⚫ Arquivado</option>
+      </select>
+      <button class="config-action-btn" onclick="openNewConvModal()" title="Nova conversa">✏️</button>
+    </div>`;
+}
+
+function renderMessages(messages,conv){
+  const el=document.getElementById('chatMessages');if(!el)return;
+  if(messages.length===0){el.innerHTML='<div class="msgs-empty">Nenhuma mensagem ainda</div>';return}
+  el.innerHTML=messages.map(m=>{
+    const isMine=m.fromMe===true;
+    const time=m.timestamp?formatMsgTime(m.timestamp.toDate?m.timestamp.toDate():new Date(m.timestamp)):'';
+    const statusIcon=isMine?(m.status==='read'?'✓✓':(m.status==='delivered'?'✓✓':'✓')):'';
+    const statusColor=isMine&&m.status==='read'?'var(--blue)':'var(--text-dark)';
+    return`<div class="msg-bubble-wrap ${isMine?'mine':'theirs'}">
+      <div class="msg-bubble ${isMine?'sent':'received'}">
+        <div class="msg-text">${esc(m.body||m.text||'').replace(/\n/g,'<br>')}</div>
+        <div class="msg-meta"><span>${time}</span>${isMine?`<span style="color:${statusColor}">${statusIcon}</span>`:''}</div>
+      </div>
+    </div>`
+  }).join('');
+  el.scrollTop=el.scrollHeight;
+}
+
+window.sendChatMessage=async function(){
+  if(!hasPerm('canSendMessages')){alert('Sem permissão para enviar mensagens.');return}
+  const input=document.getElementById('chatInput');
+  const text=(input?.value||'').trim();
+  if(!text||!activeConvId)return;
+  const conv=conversations.find(c=>c.id===activeConvId);if(!conv)return;
+  input.value='';
+  input.disabled=true;
+  // Save message to Firestore
+  const msgData={body:text,fromMe:true,timestamp:serverTimestamp(),status:'sent',senderId:currentUser.uid,senderName:currentUserData?.name||''};
+  try{
+    await fbAddDoc('conversations/'+activeConvId+'/messages',msgData);
+    await fbUpdateDoc('conversations/'+activeConvId,{lastMessage:text,lastMessageAt:serverTimestamp()});
+    // Try to actually send via Evolution API
+    const c=configs.find(x=>x.url&&x.apikey&&x.instance);
+    if(c&&conv.phone){
+      try{
+        await fetchWithTimeout(`${c.url.replace(/\/+$/,'')}/message/sendText/${c.instance}`,{method:'POST',headers:{'Content-Type':'application/json','apikey':c.apikey},body:JSON.stringify({number:conv.phone,textMessage:{text}})});
+        await fbUpdateDoc('conversations/'+activeConvId+'/messages',(await fbGetCollection('conversations/'+activeConvId+'/messages')).slice(-1)[0]?.id?'':'placeholder',{status:'delivered'});
+      }catch(e){console.warn('Evolution send error:',e.message)}
+    }
+    await addAudit('message',`Mensagem enviada para ${conv.contactName||conv.phone}`);
+  }catch(e){alert('Erro ao enviar: '+e.message)}
+  input.disabled=false;input.focus();
+};
+
+document.addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&!e.shiftKey&&document.activeElement?.id==='chatInput'){e.preventDefault();window.sendChatMessage()}
+});
+
+window.openNewConvModal=function(){document.getElementById('newConvOverlay').classList.add('show');document.getElementById('newConvPhone').value='';document.getElementById('newConvName').value='';};
+window.closeNewConvModal=function(){document.getElementById('newConvOverlay').classList.remove('show')};
+
+window.createNewConversation=async function(){
+  const phone=(document.getElementById('newConvPhone').value||'').trim();
+  const name=(document.getElementById('newConvName').value||'').trim();
+  if(!phone){alert('Digite o telefone.');return}
+  const norm=normalizePhone(phone,globalDDD);
+  if(!norm){alert('Número inválido.');return}
+  // Check if conversation already exists
+  const existing=conversations.find(c=>c.phone===norm);
+  if(existing){window.closeNewConvModal();openConversation(existing.id);return}
+  const convId=await fbAddDoc('conversations',{phone:norm,contactName:name||norm,createdAt:serverTimestamp(),lastMessageAt:serverTimestamp(),lastMessage:'',unreadCount:0,kanbanColumn:'novo',createdBy:currentUser.uid});
+  window.closeNewConvModal();
+  if(convId)setTimeout(()=>openConversation(convId),500);
+};
+
+async function moveConvToKanban(convId,column){
+  await fbUpdateDoc('conversations/'+convId,{kanbanColumn:column});
+  // Update kanban if visible
+  if(document.getElementById('pageKanban')?.classList.contains('active'))loadAndRenderKanban();
+}
+window.moveConvToKanban=moveConvToKanban;
+
+// ═══════════════════════════════════════════════
+// KANBAN
+// ═══════════════════════════════════════════════
+const KANBAN_COLUMNS=[
+  {id:'novo',label:'🔵 Novo',color:'var(--blue)'},
+  {id:'emAndamento',label:'🟡 Em andamento',color:'var(--yellow)'},
+  {id:'aguardando',label:'🟠 Aguardando',color:'var(--orange)'},
+  {id:'resolvido',label:'🟢 Resolvido',color:'var(--green)'},
+  {id:'arquivado',label:'⚫ Arquivado',color:'var(--text-dim)'},
+];
+
+async function loadAndRenderKanban(){
+  // Load fresh conversations
+  kanbanCards=await fbGetCollection('conversations');
+  kanbanCards.sort((a,b)=>(b.lastMessageAt?.seconds||0)-(a.lastMessageAt?.seconds||0));
+  renderKanban();
+}
+
+function renderKanban(){
+  const el=document.getElementById('kanbanBoard');if(!el)return;
+  el.innerHTML=KANBAN_COLUMNS.map(col=>{
+    const cards=kanbanCards.filter(c=>(c.kanbanColumn||'novo')===col.id);
+    return`<div class="kanban-col" id="kcol_${col.id}" ondragover="kanbanDragOver(event,'${col.id}')" ondrop="kanbanDrop(event,'${col.id}')" ondragleave="kanbanDragLeave(event)">
+      <div class="kanban-col-header" style="border-color:${col.color}">
+        <span style="color:${col.color}">${col.label}</span>
+        <span class="kanban-count" style="background:${col.color}20;color:${col.color}">${cards.length}</span>
+      </div>
+      <div class="kanban-cards" id="kcards_${col.id}">
+        ${cards.map(c=>renderKanbanCard(c,col)).join('')}
+        ${cards.length===0?`<div class="kanban-empty">Arraste cards aqui</div>`:''}
+      </div>
+    </div>`
+  }).join('');
+}
+
+function renderKanbanCard(conv,col){
+  const lastTime=conv.lastMessageAt?formatMsgTime(conv.lastMessageAt.toDate?conv.lastMessageAt.toDate():new Date(conv.lastMessageAt)):'';
+  const unread=conv.unreadCount>0?`<span class="unread-badge sm">${conv.unreadCount}</span>`:'';
+  const canMove=hasPerm('canMoveKanban');
+  return`<div class="kanban-card" draggable="${canMove}" id="kcard_${conv.id}" 
+    ondragstart="${canMove?`kanbanDragStart(event,'${conv.id}')`:'event.preventDefault()'}" 
+    ondragend="kanbanDragEnd(event)">
+    <div class="kcard-header">
+      <div class="conv-avatar xs" style="background:${stringToColor(conv.contactName||conv.phone||'?')}">${getInitials(conv.contactName||conv.phone||'?')}</div>
+      <div class="kcard-name">${esc(conv.contactName||formatPhone(conv.phone)||'Desconhecido')}</div>
+      ${unread}
+    </div>
+    <div class="kcard-phone">${conv.phone||''}</div>
+    ${conv.lastMessage?`<div class="kcard-last">${esc(truncate(conv.lastMessage,60))}</div>`:''}
+    <div class="kcard-footer">
+      <span class="kcard-time">${lastTime}</span>
+      <div class="kcard-actions">
+        ${canMove?`<select class="kcard-move-sel" onclick="event.stopPropagation()" onchange="kanbanMoveCard('${conv.id}',this.value)">
+          ${KANBAN_COLUMNS.map(c=>`<option value="${c.id}" ${(conv.kanbanColumn||'novo')===c.id?'selected':''}>${c.label}</option>`).join('')}
+        </select>`:''}
+        <button class="config-action-btn" style="width:24px;height:24px;font-size:11px" onclick="openConvFromKanban('${conv.id}')">💬</button>
+      </div>
+    </div>
+  </div>`
+}
+
+window.kanbanDragStart=function(e,cardId){kanbanDragId=cardId;e.dataTransfer.effectAllowed='move';setTimeout(()=>document.getElementById('kcard_'+cardId)?.classList.add('dragging'),0)};
+window.kanbanDragEnd=function(e){kanbanDragId=null;document.querySelectorAll('.kanban-card').forEach(el=>el.classList.remove('dragging'));document.querySelectorAll('.kanban-col').forEach(el=>el.classList.remove('drag-over'))};
+window.kanbanDragOver=function(e,colId){e.preventDefault();e.dataTransfer.dropEffect='move';document.getElementById('kcol_'+colId)?.classList.add('drag-over')};
+window.kanbanDragLeave=function(e){if(!e.currentTarget.contains(e.relatedTarget))e.currentTarget.classList.remove('drag-over')};
+window.kanbanDrop=async function(e,colId){e.preventDefault();e.currentTarget.classList.remove('drag-over');if(!kanbanDragId||!hasPerm('canMoveKanban'))return;await kanbanMoveCard(kanbanDragId,colId);kanbanDragId=null};
+window.kanbanMoveCard=async function(convId,colId){
+  await fbUpdateDoc('conversations/'+convId,{kanbanColumn:colId});
+  const idx=kanbanCards.findIndex(c=>c.id===convId);
+  if(idx>=0)kanbanCards[idx].kanbanColumn=colId;
+  renderKanban();
+};
+window.openConvFromKanban=function(convId){showPage('pageMessaging');setTimeout(()=>openConversation(convId),300)};
+
+// ═══════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════
+function getKanbanLabel(col){return{novo:'Novo',emAndamento:'Em andamento',aguardando:'Aguardando',resolvido:'Resolvido',arquivado:'Arquivado'}[col]||col}
+function truncate(s,n){return(s||'').length>n?s.slice(0,n)+'…':s}
+function formatPhone(p){if(!p)return'';if(p.startsWith('55')&&p.length>=12){const ddd=p.slice(2,4),num=p.slice(4);return`(${ddd}) ${num.length===9?num.slice(0,5)+'-'+num.slice(5):num.slice(0,4)+'-'+num.slice(4)}`}return p}
+function formatMsgTime(date){const now=new Date();const d=new Date(date);if(isNaN(d))return'';const diffMs=now-d;const diffDays=Math.floor(diffMs/86400000);if(diffDays===0)return d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});if(diffDays===1)return'Ontem';if(diffDays<7)return d.toLocaleDateString('pt-BR',{weekday:'short'});return d.toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'})}
+function getInitials(name){const parts=(name||'').trim().split(/\s+/);if(parts.length>=2)return(parts[0][0]+parts[1][0]).toUpperCase();return(name||'?').slice(0,2).toUpperCase()}
+function stringToColor(str){let hash=0;for(let i=0;i<str.length;i++){hash=str.charCodeAt(i)+((hash<<5)-hash)}const h=Math.abs(hash)%360;return`hsl(${h},45%,35%)`}
+
+function syncWindowState(){window.configs=configs;window.masterTemplates=masterTemplates;window.userTemplates=userTemplates;window.masterOverrides=masterOverrides;window.enabledMasterIdx=enabledMasterIdx}
+syncWindowState();
+</script>
+<style>
+:root{--bg:#0c0a0e;--surface:#15121a;--surface2:#1e1a24;--surface3:#282430;--border:#302a3a;--orange:#D35233;--orange-light:#e06a4d;--orange-glow:rgba(211,82,51,.15);--orange-dim:rgba(211,82,51,.08);--red:#ff4757;--yellow:#ffa502;--blue:#6c8fff;--purple:#c084fc;--green:#25D366;--text:#ede8f2;--text-dim:#8a839a;--text-dark:#5a5468;--cream:#f5efe6}
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+.bg-pattern{position:fixed;inset:0;z-index:0;opacity:.35;background-image:radial-gradient(ellipse 80% 60% at 50% -20%,rgba(211,82,51,.08),transparent),radial-gradient(circle at 80% 80%,rgba(211,82,51,.04),transparent)}
+.container{position:relative;z-index:1;max-width:960px;margin:0 auto;padding:24px 24px 60px}.page{display:none}.page.active{display:block}
+
+/* LOGIN */
+.login-wrap{min-height:calc(100vh - 100px);display:flex;align-items:center;justify-content:center;padding:24px}.login-box{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:40px 36px;width:100%;max-width:380px;text-align:center}.login-box img{height:48px;margin-bottom:18px;filter:drop-shadow(0 2px 12px rgba(211,82,51,.25))}.login-box h1{font-family:'JetBrains Mono',monospace;font-size:20px;color:var(--cream);margin-bottom:4px}.login-box h1 span{color:var(--orange)}.login-box>p{color:var(--text-dim);font-size:12px;margin-bottom:24px}
+.login-field{margin-bottom:14px;text-align:left}.login-field label{display:block;font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:4px}.login-field input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:11px 14px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:13px;outline:none;transition:border-color .2s}.login-field input:focus{border-color:var(--orange);box-shadow:0 0 0 3px var(--orange-glow)}.login-error{color:var(--red);font-size:11px;margin-bottom:10px;min-height:16px}.login-btn{width:100%;padding:12px;background:var(--orange);color:#fff;border:none;border-radius:11px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:all .2s;margin-top:6px}.login-btn:hover{background:var(--orange-light)}
+
+/* HEADER */
+header{text-align:center;margin-bottom:32px;position:relative}.logo-wrap{margin-bottom:14px}.logo-wrap img{height:48px;filter:drop-shadow(0 2px 12px rgba(211,82,51,.25))}header h1{font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700;color:var(--cream);margin-bottom:4px}header h1 span{color:var(--orange)}header>p{color:var(--text-dim);font-size:13px;max-width:440px;margin:0 auto}.header-actions{position:absolute;top:0;right:0;display:flex;gap:8px}.header-actions-left{position:absolute;top:0;left:0;display:flex;gap:8px}
+.conn-indicator{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--text-dim);margin-top:8px}.conn-indicator .dot{width:6px;height:6px;border-radius:50%}.user-badge{font-size:10px;color:var(--text-dim);margin-top:4px}.user-badge strong{color:var(--orange)}
+.hdr-btn{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:9px 14px;color:var(--text);font-family:'DM Sans',sans-serif;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .2s;position:relative}.hdr-btn:hover{border-color:var(--orange);background:var(--surface2)}.hdr-btn .dot{width:7px;height:7px;border-radius:50%;background:var(--red);transition:background .3s}.hdr-btn .dot.on{background:var(--green)}
+.msg-badge-dot{position:absolute;top:-4px;right:-4px;background:var(--red);color:#fff;font-size:10px;font-weight:700;width:18px;height:18px;border-radius:50%;display:none;align-items:center;justify-content:center;border:2px solid var(--bg)}
+
+/* COMMON */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px}.card-title{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--orange);margin-bottom:16px;display:flex;align-items:center;gap:8px}.card-title .num{width:22px;height:22px;background:var(--orange);color:#fff;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:700}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}.form-row.triple{grid-template-columns:1fr 1fr 1fr}label{display:block;font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:4px}input[type="text"],input[type="password"],input[type="number"],input[type="email"],select,textarea{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px 12px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none;transition:border-color .2s}textarea{font-family:'DM Sans',sans-serif;font-size:13px;resize:vertical;min-height:70px;line-height:1.5}input:focus,select:focus,textarea:focus{border-color:var(--orange);box-shadow:0 0 0 3px var(--orange-glow)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:11px 24px;border:none;border-radius:11px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s}.btn-full{width:100%}.btn-primary{background:var(--orange);color:#fff;box-shadow:0 4px 20px rgba(211,82,51,.3)}.btn-primary:hover:not(:disabled){background:var(--orange-light)}.btn-primary:disabled{opacity:.4;cursor:not-allowed}.btn-secondary{background:var(--surface2);color:var(--text);border:1px solid var(--border)}.btn-secondary:hover{border-color:var(--orange)}.btn-small{padding:7px 14px;font-size:11px;border-radius:8px}.btn-danger{background:var(--red);color:#fff;padding:7px 14px;font-size:11px;border-radius:8px;border:none;cursor:pointer;font-weight:600;font-family:'DM Sans',sans-serif}
+.btn-whatsapp{background:#25D366;color:#fff;padding:6px 14px;font-size:11px;border-radius:8px;border:none;cursor:pointer;font-weight:600;transition:all .15s;font-family:'DM Sans',sans-serif}.btn-whatsapp:hover{background:#2ee676}.btn-group{display:flex;gap:10px;margin-top:14px}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(10px);z-index:100;display:none;align-items:flex-start;justify-content:center;padding:30px 20px;overflow-y:auto}.overlay.show{display:flex}.modal{background:var(--surface);border:1px solid var(--border);border-radius:20px;width:100%;max-width:700px;padding:28px;position:relative;animation:slideUp .3s ease}@keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}.modal-header h2{font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:700;color:var(--cream)}.modal-close{width:34px;height:34px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text-dim);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center}.modal-close:hover{border-color:var(--red);color:var(--red)}
+.info-banner{background:rgba(211,82,51,.06);border:1px solid rgba(211,82,51,.15);border-radius:10px;padding:12px 14px;font-size:11px;color:var(--orange-light);line-height:1.6;margin-bottom:16px}
+.config-item{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:12px}.config-item.active{border-color:var(--green)}.config-item.error{border-color:var(--red)}.config-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}.config-header-left{display:flex;align-items:center;gap:8px}.config-badge{font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;padding:3px 8px;border-radius:5px;text-transform:uppercase}.config-badge.primary{background:var(--orange-glow);color:var(--orange);border:1px solid rgba(211,82,51,.3)}.config-badge.fallback{background:rgba(255,165,2,.1);color:var(--yellow);border:1px solid rgba(255,165,2,.3)}.config-name{font-weight:600;font-size:14px}.config-actions{display:flex;gap:5px}.config-action-btn{width:30px;height:30px;background:var(--surface);border:1px solid var(--border);border-radius:7px;color:var(--text-dim);font-size:13px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s}.config-action-btn:hover{border-color:var(--orange);color:var(--orange)}.config-action-btn.del:hover{border-color:var(--red);color:var(--red)}.config-fields{display:none}.config-fields.show{display:block}.config-status{font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:5px}.config-status .dot{width:6px;height:6px;border-radius:50%}.config-status .dot.ok{background:var(--green)}.config-status .dot.err{background:var(--red)}.config-status .dot.unk{background:var(--text-dark)}
+.upload-zone{border:2px dashed var(--border);border-radius:14px;padding:32px;text-align:center;cursor:pointer;transition:all .3s}.upload-zone:hover,.upload-zone.dragover{border-color:var(--orange);background:var(--orange-dim)}.upload-zone .upload-icon{font-size:30px;margin-bottom:8px;opacity:.7}.upload-zone .upload-text{font-size:12px;color:var(--text-dim);line-height:1.6}.upload-zone .upload-text strong{color:var(--orange)}.upload-zone input{display:none}.file-info{display:none;background:var(--surface2);border-radius:10px;padding:11px 14px;margin-top:12px;font-size:12px;align-items:center;gap:8px}.file-info.show{display:flex}.file-info .fname{flex:1;font-family:'JetBrains Mono',monospace;color:var(--orange);font-size:11px}.file-info .fsize{color:var(--text-dim);font-size:11px}.file-info .remove{cursor:pointer;color:var(--red);font-size:15px}.column-mapping{display:none;margin-top:14px}.column-mapping.show{display:block}
+.progress-section{display:none}.progress-section.show{display:block}.progress-bar-container{background:var(--bg);border-radius:8px;height:7px;overflow:hidden;margin:12px 0}.progress-bar{height:100%;background:linear-gradient(90deg,var(--orange),var(--orange-light));border-radius:8px;width:0%;transition:width .3s}.progress-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}.stat{background:var(--bg);border-radius:10px;padding:11px;text-align:center}.stat .num{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700}.stat .lbl{font-size:10px;color:var(--text-dim);margin-top:2px;text-transform:uppercase;letter-spacing:.5px}.stat.valid .num{color:var(--green)}.stat.invalid .num{color:var(--red)}.stat.dup .num{color:var(--yellow)}.log-area{background:var(--bg);border-radius:10px;padding:12px;margin-top:12px;max-height:160px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:10px;line-height:1.8}.log-line{color:var(--text-dim)}.log-line.ok{color:var(--green)}.log-line.fail{color:var(--red)}.log-line.warn{color:var(--yellow)}.log-line.info{color:var(--blue)}.log-line.switch{color:var(--purple)}
+.result-section{display:none;text-align:center}.result-section.show{display:block}.result-icon{font-size:40px;margin-bottom:12px}.result-buttons{display:flex;flex-direction:column;gap:10px;max-width:380px;margin:0 auto}.help-text{font-size:10px;color:var(--text-dim);margin-top:5px;line-height:1.5}
+.send-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px}.send-header-left{display:flex;align-items:center;gap:12px}.back-btn{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:8px 14px;color:var(--text);font-size:12px;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .2s;font-family:'DM Sans',sans-serif;font-weight:600}.back-btn:hover{border-color:var(--orange)}.send-header h2{font-family:'JetBrains Mono',monospace;font-size:17px;color:var(--cream)}.send-header-right{display:flex;gap:8px}.send-stats-bar{display:flex;gap:14px;margin-bottom:18px;flex-wrap:wrap}.send-stat{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 18px;font-size:12px;display:flex;align-items:center;gap:8px}.send-stat .val{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:16px}.send-stat .val.g{color:var(--green)}.send-stat .val.y{color:var(--yellow)}
+.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:14px;background:var(--surface)}table{width:100%;border-collapse:collapse;font-size:12px}thead th{background:var(--surface2);padding:12px 14px;text-align:left;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--orange);border-bottom:1px solid var(--border);white-space:nowrap;position:sticky;top:0;z-index:2}tbody td{padding:10px 14px;border-bottom:1px solid var(--border);vertical-align:middle;white-space:nowrap}tbody tr:hover{background:var(--surface2)}.td-phone{font-family:'JetBrains Mono',monospace;font-size:11px}.td-name{font-weight:500}.td-chamado{color:var(--text-dim);font-family:'JetBrains Mono',monospace;font-size:11px}.td-datetime{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)}.sent-badge{background:rgba(37,211,102,.1);color:var(--green);padding:3px 10px;border-radius:6px;font-size:10px;font-weight:700}
+.msg-item{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px}.msg-item-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}.var-tag{display:inline-block;background:var(--orange-glow);color:var(--orange);padding:2px 8px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer;margin:2px;border:1px solid rgba(211,82,51,.3)}.advogado-config{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px}
+.admin-tabs{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);overflow-x:auto}.admin-tab{padding:10px 18px;font-size:12px;font-weight:600;color:var(--text-dim);cursor:pointer;border-bottom:2px solid transparent;transition:all .2s;font-family:'DM Sans',sans-serif;background:none;border-top:none;border-left:none;border-right:none;white-space:nowrap}.admin-tab:hover{color:var(--text)}.admin-tab.active{color:var(--orange);border-bottom-color:var(--orange)}.admin-panel{display:none}.admin-panel.active{display:block}
+.user-row{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px 18px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:12px}.user-row .user-info{flex:1}.user-row .user-info .uname{font-weight:600;font-size:14px}.user-row .user-info .urole{font-size:10px;color:var(--text-dim)}.ustatus{font-size:10px;padding:2px 8px;border-radius:4px;display:inline-block;margin-left:8px}.ustatus.active-s{background:rgba(37,211,102,.1);color:var(--green)}.ustatus.suspended{background:rgba(255,71,87,.1);color:var(--red)}.user-row .user-actions{display:flex;gap:5px;flex-wrap:wrap}
+.audit-row{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:6px;font-size:11px;line-height:1.6}.audit-row .audit-meta{color:var(--text-dim);font-size:10px;font-family:'JetBrains Mono',monospace}.audit-row .audit-detail{margin-top:4px}.audit-filters{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:center}.audit-filters select{max-width:200px;padding:8px 10px;font-size:11px}
+/* QR CHECK */
+.qr-result{border-radius:12px;padding:16px;display:flex;align-items:center;gap:14px;font-size:13px}.qr-result.is-wa{background:rgba(37,211,102,.08);border:1px solid rgba(37,211,102,.25)}.qr-result.no-wa{background:rgba(255,71,87,.08);border:1px solid rgba(255,71,87,.25)}.qr-result.checking{background:var(--surface2);border:1px solid var(--border)}.qr-result .qr-icon{font-size:28px}.qr-result .qr-info{flex:1}.qr-result .qr-phone{font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700}.qr-result .qr-status{font-size:11px;margin-top:2px}.qr-result .qr-status.ok{color:var(--green)}.qr-result .qr-status.fail{color:var(--red)}.qr-result .qr-status.load{color:var(--text-dim)}
+.qr-history-item{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-bottom:6px;display:flex;align-items:center;gap:10px;font-size:12px}.qr-history-item .qr-h-icon{font-size:16px}.qr-history-item .qr-h-phone{font-family:'JetBrains Mono',monospace;flex:1;font-size:11px}.qr-history-item .qr-h-name{color:var(--text-dim);font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis}.qr-history-item .qr-h-time{color:var(--text-dark);font-size:10px;font-family:'JetBrains Mono',monospace}
+/* BATCH PAUSE */
+.batch-pause{position:fixed;inset:0;background:rgba(0,0,0,.85);backdrop-filter:blur(12px);z-index:200;display:none;align-items:center;justify-content:center;flex-direction:column;gap:16px}.batch-pause.show{display:flex}.batch-pause-box{background:var(--surface);border:1px solid var(--orange);border-radius:20px;padding:36px 48px;text-align:center;animation:slideUp .3s ease;max-width:420px}.batch-pause-box .bp-icon{font-size:48px;margin-bottom:12px}.batch-pause-box h3{font-family:'JetBrains Mono',monospace;font-size:16px;color:var(--cream);margin-bottom:8px}.batch-pause-box p{color:var(--text-dim);font-size:12px;line-height:1.5;margin-bottom:16px}.batch-pause-timer{font-family:'JetBrains Mono',monospace;font-size:36px;font-weight:700;color:var(--orange);margin-bottom:12px}.batch-pause-bar-wrap{background:var(--bg);border-radius:8px;height:6px;overflow:hidden;width:100%}.batch-pause-bar{height:100%;background:linear-gradient(90deg,var(--orange),var(--orange-light));border-radius:8px;width:0%;transition:width 1s linear}
+
+/* ═══════ MESSAGING ═══════ */
+.messaging-layout{display:grid;grid-template-columns:320px 1fr;height:calc(100vh - 120px);gap:0;background:var(--surface);border:1px solid var(--border);border-radius:16px;overflow:hidden}
+.conv-panel{border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.conv-panel-header{padding:16px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:10px}
+.conv-panel-header h3{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--orange);font-weight:700;letter-spacing:1px;text-transform:uppercase}
+.conv-search{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;color:var(--text);font-size:12px;font-family:'DM Sans',sans-serif;outline:none;width:100%;transition:border-color .2s}.conv-search:focus{border-color:var(--orange)}
+.conv-list{flex:1;overflow-y:auto;padding:8px}
+.conv-item{display:flex;gap:12px;padding:12px;border-radius:12px;cursor:pointer;transition:all .2s;margin-bottom:4px}.conv-item:hover{background:var(--surface2)}.conv-item.active{background:var(--surface3);border-left:3px solid var(--orange)}
+.conv-avatar{width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff;flex-shrink:0;font-family:'JetBrains Mono',monospace}.conv-avatar.sm{width:34px;height:34px;font-size:12px}.conv-avatar.xs{width:26px;height:26px;font-size:10px}
+.conv-info{flex:1;min-width:0}.conv-header-row,.conv-last-row{display:flex;align-items:center;justify-content:space-between;gap:6px}.conv-name{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.conv-time{font-size:10px;color:var(--text-dim);flex-shrink:0;font-family:'JetBrains Mono',monospace}.conv-last{font-size:11px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.conv-empty{padding:40px 20px;text-align:center;color:var(--text-dim);font-size:13px}
+.unread-badge{background:var(--orange);color:#fff;font-size:10px;font-weight:700;width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0}.unread-badge.sm{width:16px;height:16px;font-size:9px}
+.kanban-pill{font-size:9px;font-weight:700;padding:2px 7px;border-radius:5px;border:1px solid;flex-shrink:0;white-space:nowrap}
+
+.chat-panel{display:flex;flex-direction:column;overflow:hidden}
+.chat-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;background:var(--surface);min-height:62px}
+.chat-hdr-left{display:flex;align-items:center;gap:10px}.chat-hdr-right{display:flex;align-items:center;gap:8px}
+.chat-name{font-weight:600;font-size:14px}.chat-phone{font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace}
+.kanban-select{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;color:var(--text);font-size:11px;cursor:pointer;font-family:'DM Sans',sans-serif}
+.chat-messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:6px;background:var(--bg)}
+.msgs-empty{color:var(--text-dim);font-size:12px;text-align:center;padding:40px}
+.msg-bubble-wrap{display:flex}.msg-bubble-wrap.mine{justify-content:flex-end}.msg-bubble-wrap.theirs{justify-content:flex-start}
+.msg-bubble{max-width:72%;padding:10px 14px;border-radius:16px;font-size:13px;line-height:1.5;position:relative}
+.msg-bubble.sent{background:var(--orange);color:#fff;border-bottom-right-radius:4px}.msg-bubble.received{background:var(--surface2);color:var(--text);border-bottom-left-radius:4px}
+.msg-meta{display:flex;align-items:center;justify-content:flex-end;gap:5px;margin-top:4px;font-size:10px;opacity:.75}
+.chat-input-area{padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:flex-end;background:var(--surface)}
+.chat-input{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:11px 14px;color:var(--text);font-size:13px;font-family:'DM Sans',sans-serif;outline:none;flex:1;resize:none;min-height:44px;max-height:120px;transition:border-color .2s;line-height:1.5}.chat-input:focus{border-color:var(--orange)}.chat-input:disabled{opacity:.5}
+.send-btn{background:var(--orange);border:none;border-radius:10px;padding:11px 16px;color:#fff;cursor:pointer;font-size:18px;transition:all .2s;flex-shrink:0}.send-btn:hover{background:var(--orange-light)}.send-btn:disabled{opacity:.4;cursor:not-allowed}
+.chat-empty-state{flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:var(--text-dim)}.chat-empty-state div:first-child{font-size:48px}
+
+/* ═══════ KANBAN ═══════ */
+.kanban-page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}.kanban-board-wrap{overflow-x:auto;padding-bottom:16px}
+.kanban-board{display:flex;gap:16px;min-width:max-content;align-items:flex-start}
+.kanban-col{width:260px;background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden;flex-shrink:0;transition:all .2s}.kanban-col.drag-over{border-color:var(--orange);background:var(--orange-dim)}
+.kanban-col-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;font-weight:700;font-size:12px;border-top:3px solid transparent}
+.kanban-count{font-size:11px;font-weight:700;padding:2px 8px;border-radius:5px}
+.kanban-cards{padding:10px;min-height:80px}
+.kanban-empty{color:var(--text-dark);font-size:11px;text-align:center;padding:20px;border:2px dashed var(--border);border-radius:10px}
+.kanban-card{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:8px;cursor:grab;transition:all .2s;user-select:none}.kanban-card:hover{border-color:rgba(211,82,51,.4);box-shadow:0 4px 16px rgba(0,0,0,.3)}.kanban-card.dragging{opacity:.4;transform:rotate(2deg)}
+.kcard-header{display:flex;align-items:center;gap:8px;margin-bottom:6px}.kcard-name{font-weight:600;font-size:12px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.kcard-phone{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-bottom:4px}.kcard-last{font-size:11px;color:var(--text-dim);margin-bottom:8px;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.kcard-footer{display:flex;align-items:center;justify-content:space-between;gap:6px}.kcard-time{font-size:10px;color:var(--text-dark);font-family:'JetBrains Mono',monospace}.kcard-actions{display:flex;gap:4px;align-items:center}
+.kcard-move-sel{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:3px 6px;color:var(--text);font-size:10px;cursor:pointer;max-width:110px}
+
+/* PERMISSIONS */
+.perm-row{display:flex;align-items:center;gap:10px;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;cursor:pointer;font-size:13px;font-weight:500}
+.perm-row input[type="checkbox"]{width:16px;height:16px;accent-color:var(--orange);cursor:pointer;flex-shrink:0}
+
+/* WHATSAPP CONNECT STATUS */
+.conn-status-badge{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:10px;font-size:12px;font-weight:600}.conn-status-badge.connected{background:rgba(37,211,102,.1);color:var(--green);border:1px solid rgba(37,211,102,.3)}.conn-status-badge.disconnected{background:rgba(255,71,87,.1);color:var(--red);border:1px solid rgba(255,71,87,.2)}
+
+@media(max-width:740px){.messaging-layout{grid-template-columns:1fr;height:auto}.conv-panel{height:300px}.chat-panel{height:calc(100vh - 400px)}.kanban-board{flex-direction:column;min-width:unset}.kanban-col{width:100%}.form-row,.form-row.triple{grid-template-columns:1fr}.progress-stats{grid-template-columns:repeat(2,1fr)}header h1{font-size:18px}.header-actions,.header-actions-left{position:static;justify-content:center;margin-bottom:8px}.user-row{flex-direction:column;align-items:flex-start}.send-header{flex-direction:column;align-items:flex-start}}
+</style>
+</head>
+<body>
+<div class="bg-pattern"></div>
+<div class="container">
+
+<!-- ══════════════ LOGIN ══════════════ -->
+<div class="page active" id="pageLogin">
+<div class="login-wrap"><div class="login-box">
+  <img src="https://i.imgur.com/CV8S5GQ.png" alt="MIA">
+  <h1><span>Expansão</span> Digital</h1>
+  <p>Validação de números de WhatsApp e envio de mensagens</p>
+  <div class="login-field"><label>E-mail</label><input type="email" id="loginUser" placeholder="seu@email.com" autofocus></div>
+  <div class="login-field"><label>Senha</label><input type="password" id="loginPass" placeholder="••••••••"></div>
+  <div class="login-error" id="loginError"></div>
+  <button class="login-btn" onclick="doLogin()">Entrar</button>
+</div></div>
+</div>
+
+<!-- ══════════════ MAIN ══════════════ -->
+<div class="page" id="pageMain">
+  <header>
+    <div class="header-actions-left">
+      <button class="hdr-btn" onclick="doLogout()">🚪 Sair</button>
+      <button class="hdr-btn" onclick="showPage('pageAdmin')" id="btnAdmin" style="display:none">👑 Admin</button>
+    </div>
+    <div class="header-actions">
+      <button class="hdr-btn" onclick="showPage('pageKanban')" id="btnKanban" style="display:none">📋 Kanban</button>
+      <button class="hdr-btn" onclick="showPage('pageMessaging')" id="btnMessaging" style="display:none">
+        💬 Mensagens
+        <span class="msg-badge-dot" id="msgBadge"></span>
+      </button>
+      <button class="hdr-btn" onclick="openSettings()" id="btnApiHeader" style="display:none"><span class="dot" id="headerDot"></span> ⚙️ API</button>
+      <button class="hdr-btn" onclick="openMsgSettings()">💬 Msgs</button>
+    </div>
+    <div class="logo-wrap"><img src="https://i.imgur.com/CV8S5GQ.png" alt="MIA"></div>
+    <h1><span>Expansão</span> Digital</h1>
+    <p>Validação de números de WhatsApp e envio de mensagens</p>
+    <div class="user-badge">Logado como: <strong id="loggedUserDisplay"></strong></div>
+    <div class="conn-indicator"><span class="dot" id="headerConnDot" style="background:var(--text-dark)"></span><span id="headerConnText">Sem config</span></div>
+  </header>
+
+  <div class="card">
+    <div class="card-title">🔎 Consulta Rápida</div>
+    <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+      <div style="flex:1;min-width:200px"><label>Telefone</label><input type="text" id="quickPhone" placeholder="(11) 99999-9999" style="font-size:14px;padding:12px"></div>
+      <div style="min-width:120px"><label>Nome (opcional)</label><input type="text" id="quickName" placeholder="João Silva"></div>
+      <button class="btn btn-primary" id="btnQuickCheck" onclick="quickCheck()" style="height:44px;white-space:nowrap">🔍 Validar</button>
+    </div>
+    <div id="quickResult" style="display:none;margin-top:14px"></div>
+    <div id="quickHistory" style="margin-top:14px"></div>
+  </div>
+
+  <div style="text-align:center;margin:-4px 0 12px;color:var(--text-dark);font-size:11px;letter-spacing:1px">— ou consulte em lote —</div>
+
+  <div class="card"><div class="card-title"><span class="num">1</span> Upload</div>
+    <div class="upload-zone" id="dropZone" onclick="document.getElementById('fileInput').click()"><div class="upload-icon">📄</div><div class="upload-text">Arraste <strong>.xlsx</strong> ou <strong>.csv</strong> aqui</div><input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.tsv" onchange="handleFile(event)"></div>
+    <div class="file-info" id="fileInfo"><span>📎</span><span class="fname" id="fileName"></span><span class="fsize" id="fileSize"></span><span class="remove" onclick="removeFile()">✕</span></div>
+    <div class="column-mapping" id="columnMapping"><div class="form-row triple"><div><label>CHAMADO</label><select id="colChamado"></select></div><div><label>NOME</label><select id="colName"></select></div><div><label>TELEFONES</label><select id="colPhones"></select></div></div></div>
+  </div>
+  <div class="card"><div class="card-title"><span class="num">2</span> Processar</div><button class="btn btn-primary btn-full" id="btnProcess" onclick="startProcessing()" disabled>🚀 Validar</button><p class="help-text" style="text-align:center;margin-top:8px" id="processHint">Faça upload para começar.</p></div>
+  <div class="card progress-section" id="progressSection"><div class="card-title">⏳ Processando...</div><div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim)"><span id="progressText">0/0</span><span id="progressPercent">0%</span></div><div class="progress-bar-container"><div class="progress-bar" id="progressBar"></div></div><div class="progress-stats"><div class="stat"><div class="num" id="statTotal">0</div><div class="lbl">Total</div></div><div class="stat valid"><div class="num" id="statValid">0</div><div class="lbl">Válidos</div></div><div class="stat invalid"><div class="num" id="statInvalid">0</div><div class="lbl">Inválidos</div></div><div class="stat dup"><div class="num" id="statDup">0</div><div class="lbl">Duplicados</div></div></div><div class="log-area" id="logArea"></div></div>
+  <div class="card result-section" id="resultSection"><div class="result-icon">✅</div><h2 style="margin-bottom:6px;color:var(--cream)">Concluído!</h2><p style="color:var(--text-dim);margin-bottom:18px;font-size:12px" id="resultSummary"></p><div class="result-buttons"><button class="btn btn-primary btn-full" onclick="goToSendPage()">📨 Envios</button><button class="btn btn-secondary btn-full" onclick="downloadResult()">📥 Baixar</button></div></div>
+</div>
+
+<!-- ══════════════ ENVIOS ══════════════ -->
+<div class="page" id="pageSend">
+  <div class="send-header"><div class="send-header-left"><button class="back-btn" onclick="showPage('pageMain')">← Voltar</button><h2>📨 Envios</h2></div><div class="send-header-right"><button class="hdr-btn" onclick="openMsgSettings()">💬</button><button class="btn btn-secondary btn-small" onclick="downloadResult()">📥</button></div></div>
+  <div class="send-stats-bar"><div class="send-stat"><span class="val g" id="sendStatTotal">0</span> Contatos</div><div class="send-stat"><span class="val g" id="sendStatSent">0</span> Enviados</div><div class="send-stat"><span class="val y" id="sendStatPending">0</span> Pendentes</div></div>
+  <div class="table-wrap" style="max-height:65vh;overflow-y:auto"><table><thead id="sendTableHead"></thead><tbody id="sendTableBody"></tbody></table></div>
+</div>
+
+<!-- ══════════════ MENSAGERIA ══════════════ -->
+<div class="page" id="pageMessaging">
+  <div class="send-header">
+    <div class="send-header-left">
+      <button class="back-btn" onclick="showPage('pageMain')">← Voltar</button>
+      <h2>💬 Mensageria</h2>
+    </div>
+    <div class="send-header-right">
+      <button class="btn btn-primary btn-small" onclick="openNewConvModal()">✏️ Nova conversa</button>
+    </div>
+  </div>
+  <div class="messaging-layout">
+    <!-- Conversation List -->
+    <div class="conv-panel">
+      <div class="conv-panel-header">
+        <h3>Conversas</h3>
+        <input class="conv-search" id="convSearch" placeholder="🔍 Buscar..." oninput="renderConversationList()">
+      </div>
+      <div class="conv-list" id="convList">
+        <div class="conv-empty">Carregando...</div>
+      </div>
+    </div>
+    <!-- Chat Panel -->
+    <div class="chat-panel">
+      <div class="chat-header" id="chatHeader">
+        <div class="chat-empty-state" style="flex-direction:row;gap:10px;padding:0">
+          <span style="font-size:24px">💬</span>
+          <span style="font-size:13px;color:var(--text-dim)">Selecione uma conversa</span>
+        </div>
+      </div>
+      <div class="chat-messages" id="chatMessages">
+        <div class="chat-empty-state">
+          <div>💬</div>
+          <div>Selecione uma conversa ao lado para começar</div>
+        </div>
+      </div>
+      <div class="chat-input-area">
+        <textarea class="chat-input" id="chatInput" placeholder="Digite uma mensagem... (Enter para enviar, Shift+Enter nova linha)" rows="1"></textarea>
+        <button class="send-btn" onclick="sendChatMessage()">➤</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ KANBAN ══════════════ -->
+<div class="page" id="pageKanban">
+  <div class="kanban-page-header">
+    <div class="send-header-left" style="display:flex;align-items:center;gap:12px">
+      <button class="back-btn" onclick="showPage('pageMain')">← Voltar</button>
+      <h2 style="font-family:'JetBrains Mono',monospace;font-size:17px;color:var(--cream)">📋 Kanban</h2>
+    </div>
+    <button class="btn btn-secondary btn-small" onclick="loadAndRenderKanban()">🔄 Atualizar</button>
+  </div>
+  <div class="kanban-board-wrap">
+    <div class="kanban-board" id="kanbanBoard">
+      <div style="color:var(--text-dim);padding:40px;font-size:13px">Carregando...</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ ADMIN ══════════════ -->
+<div class="page" id="pageAdmin">
+  <div class="send-header"><div class="send-header-left"><button class="back-btn" onclick="showPage('pageMain')">← Voltar</button><h2>👑 Admin</h2></div></div>
+  <div class="admin-tabs">
+    <button class="admin-tab active" onclick="switchAdminTab('users',this)">👥 Usuários</button>
+    <button class="admin-tab" onclick="switchAdminTab('audit',this)">📊 Relatórios</button>
+    <button class="admin-tab" onclick="switchAdminTab('apiconf',this)">⚙️ API</button>
+    <button class="admin-tab" onclick="switchAdminTab('msgtpl',this)">💬 Templates</button>
+    <button class="admin-tab" onclick="switchAdminTab('whatsconn',this)">📱 WhatsApp</button>
+  </div>
+
+  <div class="admin-panel active" id="panelUsers">
+    <div class="card">
+      <div class="card-title">Cadastrar Usuário</div>
+      <div class="form-row" style="grid-template-columns:1fr 1fr 1fr .7fr">
+        <div><label>Nome</label><input type="text" id="newUserName" placeholder="João Silva"></div>
+        <div><label>E-mail (login)</label><input type="email" id="newUserEmail" placeholder="joao@email.com"></div>
+        <div><label>Senha</label><input type="password" id="newUserPass" placeholder="••••••"></div>
+        <div><label>Perfil</label><select id="newUserRole"><option value="user">Operador</option><option value="master">Admin</option></select></div>
+      </div>
+      <button class="btn btn-primary btn-small" id="btnCreateUser" onclick="createUser()">➕ Cadastrar</button>
+    </div>
+    <div class="card"><div class="card-title">Usuários</div><div id="usersList"></div></div>
+  </div>
+
+  <div class="admin-panel" id="panelAudit">
+    <div class="card"><div class="card-title">📊 Relatórios</div>
+      <div class="audit-filters">
+        <div><label>Usuário</label><select id="auditFilterUser"><option value="">Todos</option></select></div>
+        <div><label>Tipo</label><select id="auditFilterType"><option value="">Todos</option><option value="login">Logins</option><option value="logout">Logouts</option><option value="validation">Validações</option><option value="send">Envios</option><option value="message">Mensagens</option></select></div>
+        <button class="btn btn-secondary btn-small" onclick="renderAuditLog()" style="margin-top:18px">🔍</button>
+        <button class="btn btn-primary btn-small" onclick="downloadAuditLog()" style="margin-top:18px">📥 Baixar</button>
+      </div>
+      <div id="auditLogList" style="max-height:500px;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <div class="admin-panel" id="panelApiconf">
+    <div class="card"><div class="card-title">⚙️ API</div>
+      <div class="info-banner">🔒 Configs compartilhadas entre todos os usuários.</div>
+      <div id="adminConfigsList"></div>
+      <button class="btn btn-secondary btn-full" onclick="addNewConfig()" style="margin-top:8px">➕ Nova Config</button>
+      <div style="margin-top:16px">
+        <div class="card-title" style="margin-top:10px">⏱ Controle de Velocidade</div>
+        <div class="form-row" style="grid-template-columns:1fr 1fr 1fr 1fr 1fr">
+          <div><label>Delay mín. (ms)</label><input type="number" id="globalDelayMin" value="400" min="100" step="100"></div>
+          <div><label>Delay máx. (ms)</label><input type="number" id="globalDelayMax" value="1200" min="200" step="100"></div>
+          <div><label>Consultas por lote</label><input type="number" id="globalBatchSize" value="50" min="5" step="5"></div>
+          <div><label>Pausa entre lotes (s)</label><input type="number" id="globalBatchPause" value="120" min="10" step="10"></div>
+          <div><label>DDD padrão</label><input type="text" id="globalDDD" maxlength="2"></div>
+        </div>
+      </div>
+      <div class="btn-group" style="justify-content:flex-end"><button class="btn btn-primary" onclick="saveAllSettings()">💾 Salvar</button></div>
+    </div>
+  </div>
+
+  <div class="admin-panel" id="panelMsgtpl">
+    <div class="card"><div class="card-title">💬 Templates (todos os usuários)</div>
+      <div class="info-banner"><strong>Variáveis:</strong> <span class="var-tag">{NOME_CLIENTE}</span> <span class="var-tag">{NOME_ADVOGADO}</span> <span class="var-tag">{CHAMADO}</span></div>
+      <div class="advogado-config"><label>Nome padrão advogado</label><input type="text" id="masterAdvogadoName"></div>
+      <div id="masterMsgList"></div>
+      <button class="btn btn-secondary btn-full" onclick="addMasterTemplate()" style="margin-top:8px">➕ Template</button>
+      <div class="btn-group" style="justify-content:flex-end;margin-top:14px"><button class="btn btn-primary" onclick="saveMasterMsgSettings()">💾 Salvar</button></div>
+    </div>
+  </div>
+
+  <div class="admin-panel" id="panelWhatsconn">
+    <div style="color:var(--text-dim);padding:20px;font-size:13px">Carregando...</div>
+  </div>
+</div>
+
+<!-- ══════════════ OVERLAYS ══════════════ -->
+<!-- Settings -->
+<div class="overlay" id="settingsOverlay">
+  <div class="modal">
+    <div class="modal-header"><h2>⚙️ API</h2><button class="modal-close" onclick="closeSettings()">✕</button></div>
+    <div id="configsList"></div>
+    <button class="btn btn-secondary btn-full" onclick="addNewConfig()" style="margin-top:8px">➕ Config</button>
+    <div style="margin-top:16px">
+      <p style="font-size:11px;font-weight:600;color:var(--orange);margin-bottom:8px">⏱ CONTROLE DE VELOCIDADE</p>
+      <div class="form-row" style="grid-template-columns:1fr 1fr 1fr 1fr 1fr">
+        <div><label>Delay mín (ms)</label><input type="number" id="globalDelayMinModal" value="400" min="100" step="100"></div>
+        <div><label>Delay máx (ms)</label><input type="number" id="globalDelayMaxModal" value="1200" min="200" step="100"></div>
+        <div><label>Consultas/lote</label><input type="number" id="globalBatchSizeModal" value="50" min="5" step="5"></div>
+        <div><label>Pausa (s)</label><input type="number" id="globalBatchPauseModal" value="120" min="10" step="10"></div>
+        <div><label>DDD</label><input type="text" id="globalDDDModal" maxlength="2"></div>
+      </div>
+    </div>
+    <div class="btn-group" style="justify-content:flex-end"><button class="btn btn-secondary" onclick="closeSettings()">Cancelar</button><button class="btn btn-primary" onclick="saveAllSettings()">💾 Salvar</button></div>
+  </div>
+</div>
+
+<!-- Msg Settings -->
+<div class="overlay" id="msgOverlay">
+  <div class="modal" style="max-width:640px">
+    <div class="modal-header"><h2>💬 Mensagens</h2><button class="modal-close" onclick="closeMsgSettings()">✕</button></div>
+    <div class="info-banner"><strong>Variáveis:</strong> <span class="var-tag">{NOME_CLIENTE}</span> <span class="var-tag">{NOME_ADVOGADO}</span> <span class="var-tag">{CHAMADO}</span></div>
+    <div class="advogado-config"><label>Seu nome (remetente)</label><input type="text" id="userAdvogadoName"></div>
+    <div id="userMsgList"></div>
+    <button class="btn btn-secondary btn-full" onclick="addUserTemplate()" style="margin-top:8px">➕ Meu Template</button>
+    <div class="btn-group" style="justify-content:flex-end;margin-top:14px"><button class="btn btn-secondary" onclick="closeMsgSettings()">Cancelar</button><button class="btn btn-primary" onclick="saveUserMsgSettings()">💾 Salvar</button></div>
+  </div>
+</div>
+
+<!-- Permissions -->
+<div class="overlay" id="permOverlay">
+  <div class="modal" style="max-width:480px">
+    <div class="modal-header">
+      <h2>🔐 Permissões — <span id="permUserName" style="color:var(--orange)"></span></h2>
+      <button class="modal-close" onclick="closePermissions()">✕</button>
+    </div>
+    <input type="hidden" id="permUserId">
+    <div class="info-banner">Configure o que este usuário pode fazer no sistema.</div>
+    <div id="permsList"></div>
+    <div class="btn-group" style="justify-content:flex-end;margin-top:14px">
+      <button class="btn btn-secondary" onclick="closePermissions()">Cancelar</button>
+      <button class="btn btn-primary" onclick="savePermissions()">💾 Salvar</button>
+    </div>
+  </div>
+</div>
+
+<!-- New Conversation -->
+<div class="overlay" id="newConvOverlay">
+  <div class="modal" style="max-width:420px">
+    <div class="modal-header"><h2>✏️ Nova Conversa</h2><button class="modal-close" onclick="closeNewConvModal()">✕</button></div>
+    <div class="form-row" style="grid-template-columns:1fr">
+      <div><label>Telefone (com DDD)</label><input type="text" id="newConvPhone" placeholder="(11) 99999-9999"></div>
+      <div><label>Nome do contato (opcional)</label><input type="text" id="newConvName" placeholder="João Silva"></div>
+    </div>
+    <div class="btn-group" style="justify-content:flex-end">
+      <button class="btn btn-secondary" onclick="closeNewConvModal()">Cancelar</button>
+      <button class="btn btn-primary" onclick="createNewConversation()">💬 Iniciar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Batch pause -->
+<div class="batch-pause" id="batchPauseOverlay">
+  <div class="batch-pause-box">
+    <div class="bp-icon">⏸️</div>
+    <h3>Pausa entre lotes</h3>
+    <p>Aguardando para evitar bloqueio pela API.<br>O processamento retomará automaticamente.</p>
+    <div class="batch-pause-timer" id="batchPauseText">0:00</div>
+    <div class="batch-pause-bar-wrap"><div class="batch-pause-bar" id="batchPauseBar"></div></div>
+  </div>
+</div>
+
+</div><!-- .container -->
+</body>
+</html>
